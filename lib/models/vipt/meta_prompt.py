@@ -78,7 +78,9 @@ class PromptVisualizer:
 
     def log_histogram(self, tag: str, tensor: torch.Tensor):
         if self._writer is not None:
-            self._writer.add_histogram(tag, tensor.detach().cpu(), self._step)
+            tensor_cpu = tensor.detach().cpu()
+            if tensor_cpu.numel() > 0 and not torch.isnan(tensor_cpu).all() and not torch.isinf(tensor_cpu).all():
+                self._writer.add_histogram(tag, tensor_cpu, self._step)
 
     def log_grad_norm(self, prefix: str, module: nn.Module):
         """只记录总梯度范数"""
@@ -934,10 +936,6 @@ class TemporalPromptGenerator(nn.Module):
 
         motion_gate = 0.2 + 0.8 * torch.sigmoid(5.0 * (global_motion.squeeze(-1) - gate_threshold))  # [B, 1]
 
-        # ===== v7 Step8: 生成时序Prompt =====
-        if fused_feat is None:
-            fused_feat = aligned_feat
-        
         # ===== v7 Step8: 生成时序Prompt =====
         if fused_feat is None:
             fused_feat = aligned_feat

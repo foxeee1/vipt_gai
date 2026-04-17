@@ -7,3 +7,4 @@ pretrained/
 *.bin
 *.ckpt
 __pycache__/
+tensorboard/
