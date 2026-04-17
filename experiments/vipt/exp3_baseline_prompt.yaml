@@ -1,0 +1,110 @@
+# ============================================================
+# 实验3: 标准训练 + 全Prompt (验证Prompt模块本身的有效性)
+# ============================================================
+# 【实验目的】验证"标准训练+全Prompt"是否接近/超过基线
+# 【训练方式】标准训练(无FOMAML), 全Prompt模块启用
+# 【创新定位】Exp3证明Prompt模块本身有效, 不依赖元学习
+# ============================================================
+# 【消融逻辑】
+#   Exp1(基线) → Exp3(标准+全Prompt): 证明Prompt本身有效
+#   Exp3 → Exp4(FOMAML+全Prompt): 证明元学习让Prompt更鲁棒
+# ============================================================
+
+DATA:
+  MAX_SAMPLE_INTERVAL: 200
+  MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  SEARCH:
+    CENTER_JITTER: 3
+    FACTOR: 4.0
+    SCALE_JITTER: 0.25
+    SIZE: 256
+    NUMBER: 1
+  TEMPLATE:
+    CENTER_JITTER: 0
+    FACTOR: 2.0
+    SCALE_JITTER: 0
+    SIZE: 128
+  TRAIN:
+    DATASETS_NAME:
+    - LasHeR_train
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 12000
+  VAL:
+    DATASETS_NAME:
+    - LasHeR_val
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 1000
+  XTYPE: 'rgbrgb'
+
+MODEL:
+  PRETRAIN_FILE: "./pretrained/OSTrack_ep0300_256.pth.tar"
+  EXTRA_MERGER: False
+  RETURN_INTER: False
+  BACKBONE:
+    TYPE: vit_base_patch16_224_ce_prompt
+    STRIDE: 16
+    CE_LOC: [3, 6, 9]
+    CE_KEEP_RATIO: [0.7, 0.7, 0.7]
+    CE_TEMPLATE_RANGE: 'CTR_POINT'
+    # 【Exp3核心】全Prompt配置 (分支解耦式融合)
+    # 主分支：Base Prompt 仅在第0层注入，后续层通过 z_prompted 自然传播
+    # 元分支：Mask(9层)→Consistency(10层)→Temporal(11层)→门控融合(12层)
+    META_PROMPT: True
+    CONSISTENCY_VERSION: 'gradient'
+    BASE_PROMPT_INJECT_LAYERS: [0]  # 【关键修复】只在第0层注入，与基线模型一致
+    META_PROMPT_INJECT_LAYERS: [9, 10, 11]  # 预留字段（现使用固定分层）
+    META_ENABLE_CONSISTENCY: True  # 【启用】一致性提示
+    META_ENABLE_MASK: True  # 【启用】模态可靠性提示
+    META_ENABLE_TEMPORAL: True  # 【启用】时序提示
+    ENABLE_CROSS_ATTN: True  # 【启用】交叉注意力调制（主流顶会方法）
+    META_MODE: 'standard'  # 【standard】Prompt生成器模式（standard/fomaml）
+  HEAD:
+    TYPE: CENTER
+    NUM_CHANNELS: 256
+
+TRAIN:
+  BACKBONE_MULTIPLIER: 0.1
+  DROP_PATH_RATE: 0.1
+  CE_START_EPOCH: 4
+  CE_WARM_EPOCH: 16
+  BATCH_SIZE: 96  # 24GB显存(RTX 4090)优化：64→96 (15GB→22.5GB)
+  EPOCH: 60
+  GIOU_WEIGHT: 3.0  # 提升GIoU权重以优化IoU（原2.0→3.0)
+  L1_WEIGHT: 4.0   # 微调L1权重平衡总loss（原5.0→4.0)
+  GRAD_CLIP_NORM: 0.5
+  LR: 0.0012  # 24GB显存优化：学习率线性缩放 (BS 64→96)
+  LR_DROP_EPOCH: 48
+  NUM_WORKER: 16
+  OPTIMIZER: ADAMW
+  PRINT_INTERVAL: 50
+  SCHEDULER:
+    TYPE: step
+    DECAY_RATE: 0.1
+  VAL_EPOCH_INTERVAL: 3
+  WEIGHT_DECAY: 0.0001
+  AMP: True
+  PROMPT:
+    TYPE: vipt_deep
+  FIX_BN: true
+  SAVE_EPOCH_INTERVAL: 10
+  SAVE_LAST_N_EPOCH: 1
+
+  # 【Exp2】标准训练, 不启用FOMAML
+  META:
+    ENABLE: False
+
+TEST:
+  EPOCH: 60
+  SEARCH_FACTOR: 4.0
+  SEARCH_SIZE: 256
+  TEMPLATE_FACTOR: 2.0
+  TEMPLATE_SIZE: 128

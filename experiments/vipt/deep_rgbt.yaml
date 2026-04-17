@@ -1,0 +1,100 @@
+# 配置文件开始
+DATA:
+  # 最大采样间隔（单位：帧），用于控制数据采样密度
+  MAX_SAMPLE_INTERVAL: 200
+
+  # 图像归一化使用的RGB三通道均值
+  MEAN:
+  - 0.485  # 红色通道均值
+  - 0.456  # 绿色通道均值
+  - 0.406  # 蓝色通道均值
+
+  # 搜索区域（Search Region）的增强配置
+  SEARCH:
+    CENTER_JITTER: 3     # 中心点随机抖动范围（像素）
+    FACTOR: 4.0          # 相对于目标框的缩放倍数
+    SCALE_JITTER: 0.25   # 尺度随机抖动比例
+    SIZE: 256            # 裁剪后图像尺寸（像素）
+    NUMBER: 1            # 每个样本生成的搜索区域数量
+
+  # 图像归一化使用的RGB三通道标准差
+  STD:
+  - 0.229  # 红色通道标准差
+  - 0.224  # 绿色通道标准差
+  - 0.225  # 蓝色通道标准差
+
+  # 模板区域（Template Region）的增强配置
+  TEMPLATE:
+    CENTER_JITTER: 0     # 中心点抖动关闭（固定中心）
+    FACTOR: 2.0          # 相对于目标框的缩放倍数
+    SCALE_JITTER: 0      # 尺度抖动关闭
+    SIZE: 128            # 裁剪后图像尺寸（像素）
+
+  # 训练集配置
+  TRAIN:
+    DATASETS_NAME:        # 使用的训练数据集名称列表
+    - LasHeR_train        # 数据集名称：LasHeR_train
+    DATASETS_RATIO:       # 数据集采样比例（此处仅1个数据集）
+    - 1
+    SAMPLE_PER_EPOCH: 60000  # 每个epoch的样本采样数量
+
+  # 验证集配置
+  VAL:
+    DATASETS_NAME:        # 使用的验证数据集名称列表
+    - LasHeR_val          # 数据集名称：LasHeR_val
+    DATASETS_RATIO:       # 数据集采样比例
+    - 1
+    SAMPLE_PER_EPOCH: 10000  # 每个epoch的样本采样数量
+
+MODEL:
+  PRETRAIN_FILE: "./pretrained/OSTrack_ep0300_256.pth.tar"  # 预训练模型文件路径
+  EXTRA_MERGER: False      # 是否使用额外的特征融合模块（未启用）
+  RETURN_INTER: False      # 是否返回中间层特征（未启用）
+
+  # 骨干网络配置（基于Vision Transformer）
+  BACKBONE:
+    TYPE: vit_base_patch16_224_ce_prompt  # ViT-Base架构，16x16分块，224输入尺寸，支持候选消除和提示
+    STRIDE: 16             # 特征图步长（下采样率）
+    CE_LOC: [3, 6, 9]      # 应用候选消除（Candidate Elimination）的Transformer层索引
+    CE_KEEP_RATIO: [0.7, 0.7, 0.7]  # 各层保留的token比例（30%被消除）
+    CE_TEMPLATE_RANGE: 'CTR_POINT'  # 模板token范围策略：基于中心点选择
+
+  # 检测头配置
+  HEAD:
+    TYPE: CENTER           # 使用CenterNet风格的检测头
+    NUM_CHANNELS: 256      # 输出特征通道数
+
+TRAIN:
+  BACKBONE_MULTIPLIER: 0.1  # 骨干网络学习率缩放因子（10%于头部）
+  DROP_PATH_RATE: 0.1       # DropPath正则化概率（防过拟合）
+  CE_START_EPOCH: 4         # 开始应用候选消除的epoch（第4轮）
+  CE_WARM_EPOCH: 16         # 候选消除完全启用的epoch（渐进式启用）
+  BATCH_SIZE: 48  # 24GB显存(RTX 4090)优化：32→48
+  EPOCH: 60                 # 总训练轮数
+  GIOU_WEIGHT: 2.0          # GIoU损失函数的权重
+  L1_WEIGHT: 5.0            # L1损失函数的权重
+  GRAD_CLIP_NORM: 0.1       # 梯度裁剪阈值（防止梯度爆炸）
+  LR: 0.0006  # 24GB显存优化：学习率线性缩放 (BS 32→48)
+  LR_DROP_EPOCH: 48         # 学习率衰减的epoch（第48轮）
+  NUM_WORKER: 10            # 数据加载的线程数
+  OPTIMIZER: ADAMW          # 优化器类型（AdamW）
+  PRINT_INTERVAL: 50        # 训练日志打印间隔（每50批次）
+  SCHEDULER:
+    TYPE: step              # 学习率调整策略：阶梯式下降
+    DECAY_RATE: 0.1         # 衰减率（下降为原来的10%）
+  VAL_EPOCH_INTERVAL: 5     # 验证频率（每5个epoch验证1次）
+  WEIGHT_DECAY: 0.0001      # 权重衰减系数（L2正则化）
+  AMP: False                # 是否启用自动混合精度训练（未启用）
+  PROMPT:
+    TYPE: vipt_deep         # 提示机制类型：深层ViPT（Visual Prompt Tuning）
+  FIX_BN: true              # 是否冻结BatchNorm层参数（固定）
+  SAVE_EPOCH_INTERVAL: 5    # 模型保存间隔（每5个epoch保存1次）
+  SAVE_LAST_N_EPOCH: 1      # 保留最近N个epoch的模型（此处仅保留最后1个）
+
+TEST:
+  EPOCH: 60                 # 用于测试的模型epoch（训练完成后）
+  SEARCH_FACTOR: 4.0        # 测试时搜索区域缩放因子
+  SEARCH_SIZE: 256          # 测试时搜索区域尺寸
+  TEMPLATE_FACTOR: 2.0      # 测试时模板区域缩放因子
+  TEMPLATE_SIZE: 128        # 测试时模板区域尺寸
+  

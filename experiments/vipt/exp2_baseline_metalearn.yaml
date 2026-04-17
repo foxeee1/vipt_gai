@@ -1,0 +1,156 @@
+# ============================================================
+# 实验2: Meta-Learning基线 - FOMAML (方案A: 纯FOMAML)
+# ============================================================
+# 实验目的：验证纯FOMAML元学习训练方式的有效性（公平对比Exp1）
+# 训练方式：纯FOMAML + 固定退化强度 + cosine-LR衰减
+# 提示配置：Base Prompt注入所有12层，无Meta Prompt
+# 对比目标：exp1_baseline_standard.yaml
+# ============================================================
+# 【方案A核心约束】
+#
+#   ✅ Task Distribution独立性:
+#     → 退化强度α固定, 不受模型状态影响
+#     → 内环LR使用cosine(epoch)固定衰减
+#     → SupReg权重固定不变
+#     → 满足标准FOMAML的理论假设!
+#
+#   ✅ Health Score仅作监控:
+#     → 计算但不驱动任何训练参数
+#     → 用于判断是否需要手动调整YAML中的DEGRADE_ALPHA
+#     → TensorBoard中可观察训练健康度趋势
+#
+#   🎯 调整策略 (验证集驱动):
+#     1. 跑完一轮完整训练
+#     2. 观察验证集IoU曲线
+#     3. 如果IoU在epoch15+不稳定 → 降低DEGRADE_ALPHA (如0.20→0.15)
+#     4. 如果IoU稳定但偏低 → 可微增DEGRADE_ALPHA (如0.20→0.25)
+#     5. 重新训练, 重复直到找到最优α
+#
+#   ⚠️ 注意:
+#     - DEGRADE_ALPHA是唯一需要调整的"超参数"
+#     - 其他参数保持默认即可
+# ============================================================
+
+DATA:
+  MAX_SAMPLE_INTERVAL: 200
+  MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  SEARCH:
+    CENTER_JITTER: 3
+    FACTOR: 4.0
+    SCALE_JITTER: 0.25
+    SIZE: 256
+    NUMBER: 1
+  TEMPLATE:
+    CENTER_JITTER: 0
+    FACTOR: 2.0
+    SCALE_JITTER: 0
+    SIZE: 128
+  TRAIN:
+    DATASETS_NAME:
+    - LasHeR_train
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 12000
+  VAL:
+    DATASETS_NAME:
+    - LasHeR_val
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 1000
+  XTYPE: 'rgbrgb'
+
+MODEL:
+  PRETRAIN_FILE: "./pretrained/OSTrack_ep0300_256.pth.tar"
+  EXTRA_MERGER: False
+  RETURN_INTER: False
+  BACKBONE:
+    TYPE: vit_base_patch16_224_ce_prompt
+    STRIDE: 16
+    CE_LOC: [3, 6, 9]
+    CE_KEEP_RATIO: [0.7, 0.7, 0.7]
+    CE_TEMPLATE_RANGE: 'CTR_POINT'
+    META_PROMPT: False
+    CONSISTENCY_VERSION: 'gradient'
+    BASE_PROMPT_INJECT_LAYERS: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    META_PROMPT_INJECT_LAYERS: []
+    META_ENABLE_CONSISTENCY: False
+    META_ENABLE_MASK: False
+    META_ENABLE_TEMPORAL: False
+    ENABLE_CROSS_ATTN: True
+    META_MODE: 'standard'  # 【standard】标准训练模式
+  HEAD:
+    TYPE: CENTER
+    NUM_CHANNELS: 256
+
+TRAIN:
+  BACKBONE_MULTIPLIER: 0.1
+  DROP_PATH_RATE: 0.1
+  CE_START_EPOCH: 4
+  CE_WARM_EPOCH: 16
+  BATCH_SIZE: 96  # 24GB显存(RTX 4090)优化：64→96 (15GB→22.5GB)
+  EPOCH: 60
+  GIOU_WEIGHT: 3.0  # 提升GIoU权重以优化IoU（原2.0→3.0)
+  L1_WEIGHT: 4.0   # 微调L1权重平衡总loss（原5.0→4.0)
+  GRAD_CLIP_NORM: 0.5
+  LR: 0.0012  # 24GB显存优化：学习率线性缩放 (BS 64→96)
+  NUM_WORKER: 16
+  OPTIMIZER: ADAMW
+  PRINT_INTERVAL: 50
+  SCHEDULER:
+    TYPE: cosine
+  VAL_EPOCH_INTERVAL: 3
+  WEIGHT_DECAY: 0.0001
+  AMP: True
+  PROMPT:
+    TYPE: vipt_deep
+  FIX_BN: true
+  SAVE_EPOCH_INTERVAL: 10
+  SAVE_LAST_N_EPOCH: 1
+
+  META:
+    ENABLE: True
+    INNER_LR: 0.05
+    OUTER_LR: 0.001
+    SUPPORT_RATIO: 0.5
+    UPDATE_STEP: 1
+    INNER_GRAD_CLIP_NORM: 10.0
+    WARMUP_EPOCH: 0
+
+    # 【方案A】固定退化强度 (纯FOMAML核心参数!)
+    #   α=0.00: Query无退化 (等同于Support, 无分布差异, 不推荐)
+    #   α=0.08: 极轻度退化 (验证FOMAML机制是否生效)
+    #   α=0.12: 轻度退化 (上一轮实验值, IoU~0.61)
+    #   α=0.20: 中度退化 (IoU~0.57, 偏大)
+    # 调整策略: 先用极低α验证FOMAML有效, 再逐步增加!
+    DEGRADE_ALPHA: 0.08
+
+    SUPPORT_REG_WEIGHT: 0.1       # Support正则化权重 (降低, 减少对内环的干扰)
+
+    # 【v7新增】元任务分布控制参数 (用于Task-Aware分割)
+    # 这些参数控制task_evaluator的任务判定阈值
+    HIGH_QUALITY_THRESH: 0.6      # Base任务判定阈值 (Q > 此值为高质量)
+    LOW_QUALITY_THRESH: 0.35      # Conflict任务判定阈值 (Q < 此值为低质量)
+    CONFLICT_CONSISTENCY_THRESH: 0.25  # 一致性冲突阈值 (consistency < 此值为冲突)
+
+    # 【v7新增】Query退化强度控制
+    DEGRADE_MIN_ALPHA: 0.01       # 最小退化阈值 (所有Query样本都会退化)
+    DEGRADE_BLUR_BASE: 0.3        # 基础模糊sigma
+    DEGRADE_BLUR_SCALE: 5.0       # 模糊强度缩放系数
+    DEGRADE_NOISE_BASE: 0.01      # 基础噪声标准差
+    DEGRADE_NOISE_SCALE: 0.15     # 噪声强度缩放系数
+
+TEST:
+  EPOCH: 60
+  SEARCH_FACTOR: 4.0
+  SEARCH_SIZE: 256
+  TEMPLATE_FACTOR: 2.0
+  TEMPLATE_SIZE: 128
+  META_ADAPT_STEPS: 1
+  META_ADAPT_LR: 0.00001

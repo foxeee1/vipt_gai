@@ -1,0 +1,9 @@
+data/
+output/
+pretrained/
+*.pth
+*.tar
+*.pth.tar
+*.bin
+*.ckpt
+__pycache__/
