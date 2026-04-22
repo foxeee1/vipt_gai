@@ -35,6 +35,9 @@ cfg.MODEL.BACKBONE.CONSISTENCY_VERSION = 'fusion'  # gradient, covariance, fusio
 # 灵活注入层数配置
 cfg.MODEL.BACKBONE.BASE_PROMPT_INJECT_LAYERS = []  # Base Prompt注入层，空列表表示使用默认
 cfg.MODEL.BACKBONE.META_PROMPT_INJECT_LAYERS = []  # 元提示注入层，空列表表示使用默认
+cfg.MODEL.BACKBONE.TEMPORAL_PROMPT_INJECT_LAYERS = []  # 【v15】时序提示独立注入层，空列表表示与META_PROMPT_INJECT_LAYERS相同
+# 【v15】协同策略配置
+cfg.MODEL.BACKBONE.COOP_STRATEGY = 'temporal_modulate'  # independent, temporal_modulate, bidirectional, gating, joint_regularize
 # 可视化配置
 cfg.MODEL.BACKBONE.ENABLE_VIS = False  # 是否启用Prompt模块可视化
 cfg.MODEL.BACKBONE.VIS_LOG_INTERVAL = 50  # 可视化记录间隔（每N个step记录一次）
@@ -78,6 +81,8 @@ cfg.TRAIN.META.INNER_GRAD_CLIP_NORM = 2.0
 cfg.TRAIN.META.WARMUP_EPOCH = 0
 # 【v8.1】Support正则化权重 (外环loss = query_loss + support_reg * support_loss)
 cfg.TRAIN.META.SUPPORT_REG_WEIGHT = 0.3
+# 【v17新增】对比学习损失开关（用于gating_token_level策略）
+cfg.TRAIN.META.ENABLE_CONTRAST_LOSS = False
 
 
 cfg.TRAIN.META.HIGH_QUALITY_THRESH = 0.6

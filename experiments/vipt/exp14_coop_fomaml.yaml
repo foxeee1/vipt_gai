@@ -1,10 +1,14 @@
 # ============================================================
-# 实验7_temporal_layers7_8: Temporal Prompt 双层注入第7,8层
+# 实验14_coop_fomaml: 协同策略B - 时序调制协同 + FOMAML元学习模式
 # ============================================================
-# 【实验目的】验证v5时序提示双层注入效果（预期最优双层）
-# 【训练方式】标准训练(无FOMAML)
-# 【注入层数】Base: [0], Temporal: [7, 8]
-# 【v5创新】跨模态-时序联合一致性建模（复用Consistency权重）
+# 【实验目的】验证时序权重动态调整一致性权重 + FOMAML元学习效果
+# 【训练方式】FOMAML元学习训练
+# 【注入层数】
+#   - Base: [0]
+#   - Consistency: [5, 6, 7, 8, 9] (最优)
+#   - Temporal: [5, 6, 7, 8] (最优)
+# 【协同策略】temporal_modulate - 时序动态调制一致性
+# 【元学习模式】fomaml - 使用任务嵌入(task_emb)进行动态生成
 # ============================================================
 
 DATA:
@@ -55,13 +59,15 @@ MODEL:
     META_PROMPT: True
     CONSISTENCY_VERSION: 'fusion'
     BASE_PROMPT_INJECT_LAYERS: [0]
-    META_PROMPT_INJECT_LAYERS: [7, 8]
-    META_ENABLE_CONSISTENCY: False
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
+    COOP_STRATEGY: 'temporal_modulate'
+    META_ENABLE_CONSISTENCY: True
     META_ENABLE_MASK: False
     META_ENABLE_TEMPORAL: True
     ENABLE_CROSS_ATTN: True
     ENABLE_VIS: True
-    META_MODE: 'standard'
+    META_MODE: 'fomaml'
   HEAD:
     TYPE: CENTER
     NUM_CHANNELS: 256
@@ -71,12 +77,12 @@ TRAIN:
   DROP_PATH_RATE: 0.1
   CE_START_EPOCH: 4
   CE_WARM_EPOCH: 16
-  BATCH_SIZE: 96
+  BATCH_SIZE: 24
   EPOCH: 60
   GIOU_WEIGHT: 3.0
   L1_WEIGHT: 4.0
   GRAD_CLIP_NORM: 0.5
-  LR: 0.0012
+  LR: 0.0006
   LR_DROP_EPOCH: 48
   NUM_WORKER: 16
   OPTIMIZER: ADAMW
@@ -93,7 +99,7 @@ TRAIN:
   SAVE_EPOCH_INTERVAL: 10
   SAVE_LAST_N_EPOCH: 1
   META:
-    ENABLE: False
+    ENABLE: True
 
 TEST:
   EPOCH: 60

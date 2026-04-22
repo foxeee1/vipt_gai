@@ -724,82 +724,87 @@ class ConsistencyPromptGenerator(nn.Module):
 
 class TemporalPromptGenerator(nn.Module):
     """
-    Temporal Prompt生成器 - v7架构（彻底修复正反馈Bug + 机制解耦）
+    Temporal Prompt生成器 - v9架构（软约束 + 温度控制 + 边界陷阱修复）
 
-    【v7核心改进】
-    1. 【修复正反馈Bug】用固定放大系数+LayerNorm替代自适应放大
-       - 固定放大3倍，稳定可靠
-       - LayerNorm自动适配不同视频的信号强度
-       - 彻底杜绝帧差无限放大的正反馈循环
+    【v9核心创新】解决v8的"边界陷阱"问题：权重在0.2和0.8之间震荡
     
-    2. 【机制解耦】三个机制各司其职
-       - 运动门控：仅控制时序Prompt的整体权重，范围[0.2, 1.0]
-       - 偏移放大：固定2倍，不再随运动变化
-       - 运动偏置：固定强度0.15，仅方向由token_motion决定
+    v8问题诊断：
+      - IoU上升但avg_weight在0.2和0.8之间极端震荡
+      - weight_deviation饱和在高值（区分度过大）
+      - 根因：硬clamp[0.2,0.8] + 强正则化 → 模型只能在边界取值
     
-    3. 【简化权重生成】两阶段逻辑
-       - 第一阶段：MLP生成基础权重 sigmoid(logits)
-       - 第二阶段：运动调制微调，运动大的token更有区分度
+    v9解决方案：
     
-    4. 【元学习深度融合】task_emb调制核心参数
-       - 调制帧差编码MLP的偏置
-       - 调制运动门控的阈值
+    1. 【温度控制sigmoid】用可学习温度参数控制权重锐度
+       - 初期T=1.0：sigmoid平滑，权重分布均匀
+       - 后期自适应调整：避免过早收敛到极值
+       
+    2. 【软clamp替代硬clamp】
+       - 放宽范围到[0.05, 0.95]
+       - 用sigmoid软化边界，允许梯度流过
+       
+    3. 【动态正则化退火】
+       - 训练初期强约束（快速探索）
+       - 训练后期弱约束（稳定收敛）
+       
+    4. 【层间差异软引导】
+       - 从"惩罚相同"变为"鼓励不同"
+       - 用奖励机制而非惩罚机制
 
-    输入：
-      - rgb_feat/tir_feat: [B, N, C] 双模态特征
-      - token_consistency: [B, N] 一致性权重（用于对齐特征）
-    输出：
-      - temporal_prompt: [B, num_prompt_tokens, C]
-      - temporal_weight: [B, N] 时序权重
-      - intermediates: dict（包含global_motion用于正则化）
+    输入/输出与v8兼容
     """
-    def __init__(self, embed_dim: int, num_prompt_tokens: int = 8, hidden_dim: int = 256, mode: str = 'standard'):
+    def __init__(self, embed_dim: int, num_prompt_tokens: int = 8, hidden_dim: int = 256, mode: str = 'standard',
+                 max_layers: int = 4):
         super().__init__()
         self.num_prompt_tokens = num_prompt_tokens
         self.mode = mode
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
+        self.max_layers = max_layers
         assert mode in ['standard', 'fomaml'], f"[TemporalPromptGenerator] mode必须是'standard'或'fomaml'，实际: {mode}"
 
-        # ===== v7核心1: 帧差专用LayerNorm（替代自适应放大）=====
-        # 彻底解决正反馈问题：固定放大+LayerNorm自动归一化
+        # ===== v9核心1: 帧差专用LayerNorm =====
         self.frame_diff_norm = nn.LayerNorm(embed_dim)
 
-        # ===== v7核心2: 帧差编码MLP（元学习静态参数）=====
+        # ===== v9核心2: 帧差编码MLP =====
         self.frame_diff_encoder = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.GELU(),
             nn.Linear(128, 1)
         )
 
-        # ===== v7核心3: 时序Prompt投影层（元学习静态参数）=====
+        # ===== v9核心3: 时序Prompt投影层 =====
         self.temporal_proj = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.GELU()
         )
 
-        # ===== 可学习位置编码（元学习静态参数）=====
+        # ===== v9核心4: 基础位置编码 =====
         self.pos_encoding = nn.Parameter(torch.randn(1, num_prompt_tokens, embed_dim) * 0.01)
 
-        # ===== v7核心4: 元学习深度融合 =====
+        # ===== v9核心5: 层自适应参数 =====
+        self.layer_pos_bias = nn.Parameter(torch.zeros(max_layers, 1, embed_dim) * 0.01)
+        self.layer_logits_bias = nn.Parameter(torch.zeros(max_layers, 1))
+        self.layer_gate_threshold = nn.Parameter(torch.zeros(max_layers, 1))
+
+        # ===== v9核心6: 温度参数（关键新特性）=====
+        # 控制sigmoid的锐度，避免权重过早收敛到极值
+        self.temperature = nn.Parameter(torch.ones(1) * 2.0)  # 初始温度2.0，较平滑
+
+        # ===== v9核心7: 元学习深度融合 =====
         if self.mode == 'fomaml':
-            # task_emb调制帧差编码MLP
             self.task_emb = nn.Parameter(torch.zeros(1, 1, embed_dim))
-            # 调制运动门控阈值
-            self.gate_threshold_emb = nn.Parameter(torch.zeros(1, 1))
             nn.init.normal_(self.task_emb, std=0.01)
-            nn.init.zeros_(self.gate_threshold_emb)
 
-        # ===== v7核心5: 动态缓存（非元学习，实时维护）=====
+        # ===== v9核心8: 动态缓存 =====
         self._prev_aligned_feat_cache = None
-        self._temporal_logits_buffer = None
-        self.buffer_size = 3
+        self._prev_layer_weights = {}
+        self._current_layer_id = 0
+        self._training_step = 0  # 用于正则化退火
 
-        # ===== v7核心6: 固定超参数（不再自适应）=====
-        self.fixed_motion_scale = 3.0  # 固定放大系数
-        self.fixed_amplification = 2.0  # 固定偏移放大倍数
-        self.fixed_bias_strength = 0.15  # 固定运动偏置强度
+        # ===== v9核心9: 固定超参数 =====
+        self.fixed_motion_scale = 3.0
 
         self._init_weights()
 
@@ -817,13 +822,14 @@ class TemporalPromptGenerator(nn.Module):
     def reset_cache(self):
         """重置时序缓存（每个视频首帧调用）"""
         self._prev_aligned_feat_cache = None
-        self._temporal_logits_buffer = None
+        self._prev_layer_weights.clear()
 
     def forward(self, rgb_feat: torch.Tensor, tir_feat: torch.Tensor,
                 prev_state: Optional[torch.Tensor] = None,
                 prev_features: Optional[torch.Tensor] = None,
                 token_consistency: Optional[torch.Tensor] = None,
                 fused_feat: Optional[torch.Tensor] = None,
+                layer_id: int = 0,
                 return_intermediate: bool = False) -> tuple:
         """
         Args:
@@ -833,6 +839,7 @@ class TemporalPromptGenerator(nn.Module):
             prev_features: 兼容旧接口，不再使用
             token_consistency: [B, N] 当前帧跨模态一致性权重（用于对齐特征）
             fused_feat: [B, N, C] 融合特征（用于生成Prompt）
+            layer_id: int 当前注入层编号（v8新参数，解决双层同质化）
             return_intermediate: 是否返回中间值（供可视化使用）
         Returns:
             temporal_prompt: [B, num_prompt_tokens, C]
@@ -841,143 +848,117 @@ class TemporalPromptGenerator(nn.Module):
         """
         B, N, C = rgb_feat.shape
 
-        # ===== v7 Step1: 计算对齐特征 =====
+        # ===== v8 Step0: 层自适应参数选择（解决双层同质化）=====
+        layer_idx = min(layer_id, self.max_layers - 1)  # 安全限制
+        self._current_layer_id = layer_id
+
+        # ===== v9 Step1: 计算对齐特征 =====
         if token_consistency is None:
             token_consistency = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
         
-        # 安全校验
         if torch.isnan(token_consistency).any():
             token_consistency = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
         token_consistency = torch.clamp(token_consistency, min=0.01, max=0.99)
         
-        # 对齐特征: w*rgb + (1-w)*tir
         aligned_feat = token_consistency.unsqueeze(-1) * rgb_feat + (1 - token_consistency).unsqueeze(-1) * tir_feat
 
-        # ===== v7 Step2: 计算帧差 =====
+        # ===== v9 Step2: 计算帧差 =====
         if self._prev_aligned_feat_cache is not None and self._prev_aligned_feat_cache.shape == (B, N, C):
             frame_diff = aligned_feat - self._prev_aligned_feat_cache
         else:
             frame_diff = torch.zeros(B, N, C, device=rgb_feat.device, dtype=rgb_feat.dtype)
 
-        # ===== v7 Step3: 固定放大 + LayerNorm（彻底解决正反馈Bug）=====
-        # 【关键改进】不再使用自适应放大，而是固定放大+LayerNorm
+        # ===== v9 Step3: 固定放大 + LayerNorm =====
         frame_diff_scaled = self.fixed_motion_scale * frame_diff
-        frame_diff_normed = self.frame_diff_norm(frame_diff_scaled)  # LayerNorm自动归一化
+        frame_diff_normed = self.frame_diff_norm(frame_diff_scaled)
 
-        # 计算global_motion（仅用于门控，不再用于放大）
-        global_motion = torch.mean(torch.abs(frame_diff), dim=[1, 2], keepdim=True)  # [B, 1, 1]
+        global_motion = torch.mean(torch.abs(frame_diff_normed), dim=[1, 2], keepdim=True)
 
-        # 更新缓存
         self._prev_aligned_feat_cache = aligned_feat.detach().clone()
 
-        # ===== v7 Step4: 帧差编码 → 时序logits =====
-        # 元学习调制：task_emb影响编码过程
+        # ===== v9 Step4: 帧差编码 → 时序logits（层自适应 + 温度控制）=====
         if self.mode == 'fomaml':
-            # 用task_emb调制帧差特征
             frame_diff_modulated = frame_diff_normed + 0.1 * self.task_emb
         else:
             frame_diff_modulated = frame_diff_normed
 
         temporal_logits = self.frame_diff_encoder(frame_diff_modulated).squeeze(-1)  # [B, N]
-        temporal_logits = torch.clamp(temporal_logits, min=-5.0, max=5.0)
 
-        # ===== v7 Step5: 滑动窗口平滑 =====
+        layer_bias = self.layer_logits_bias[layer_idx]  # [1]
+        temporal_logits = temporal_logits + layer_bias
+
+        # 【v10关键1】训练时注入高斯噪声，防止logits收敛到极端值
         if self.training:
-            current_shape = (B, N)
-            if self._temporal_logits_buffer is None or len(self._temporal_logits_buffer) == 0:
-                self._temporal_logits_buffer = [temporal_logits.detach().clone()]
-            else:
-                first_buffer_shape = tuple(self._temporal_logits_buffer[0].shape)
-                if first_buffer_shape == current_shape:
-                    self._temporal_logits_buffer.append(temporal_logits.detach().clone())
-                    if len(self._temporal_logits_buffer) > self.buffer_size:
-                        self._temporal_logits_buffer.pop(0)
-                else:
-                    self._temporal_logits_buffer = [temporal_logits.detach().clone()]
+            noise_std = 0.1
+            noise = torch.randn_like(temporal_logits) * noise_std
+            temporal_logits = temporal_logits + noise
 
-        # 加权平均
-        if self._temporal_logits_buffer is not None and len(self._temporal_logits_buffer) > 0:
-            all_same_shape = all(tuple(buf.shape) == (B, N) for buf in self._temporal_logits_buffer)
-            if all_same_shape:
-                weights = [0.5 ** (len(self._temporal_logits_buffer) - i) for i in range(len(self._temporal_logits_buffer))]
-                weights = torch.tensor(weights, device=rgb_feat.device, dtype=rgb_feat.dtype)
-                weights = weights / weights.sum()
-                temporal_logits_smoothed = sum(w * buf for w, buf in zip(weights, self._temporal_logits_buffer))
-            else:
-                temporal_logits_smoothed = temporal_logits
-        else:
-            temporal_logits_smoothed = temporal_logits
+        # 【v10关键2】使用标准sigmoid（T=1.0），不使用可学习温度
+        temporal_weight = torch.sigmoid(temporal_logits)
 
-        # ===== v7 Step6: 简化的两阶段权重生成 =====
-        # 第一阶段：MLP生成基础权重
-        base_weight = torch.sigmoid(temporal_logits_smoothed)  # [B, N], 范围[0, 1]
+        # 【v10关键3】硬clamp到[0.25, 0.75]，强制中间值区域
+        # 原理：如果模型想走极端(0或1)，会被强制拉回中间
+        # 这比宽范围clamp更有效，因为限制了模型的"逃避空间"
+        temporal_weight = torch.clamp(temporal_weight, min=0.25, max=0.75)
 
-        # 第二阶段：运动调制微调
-        # 计算每个token的运动强度
-        token_motion = torch.mean(torch.abs(frame_diff.detach()), dim=-1)  # [B, N]
-        token_motion_max = token_motion.max(dim=-1, keepdim=True)[0] + 1e-8
-        token_motion_norm = token_motion / token_motion_max  # [B, N], 归一化到[0,1]
+        # 更新训练步数计数器（用于正则化退火）
+        if self.training:
+            self._training_step += 1
 
-        # 运动调制：运动大的token向两侧微调，运动小的保持不变
-        # 【关键简化】固定强度，不再随motion_gate变化
-        motion_modulation = (token_motion_norm - 0.5) * self.fixed_bias_strength  # [-0.075, 0.075]
-        temporal_weight = base_weight + motion_modulation  # [B, N]
+        # ===== v10 Step5: 运动门控（层自适应阈值）=====
+        layer_gate_threshold = 0.3 + self.layer_gate_threshold[layer_idx]
+        motion_gate = 0.3 + 0.7 * torch.sigmoid(2.0 * (global_motion.squeeze(-1) - layer_gate_threshold))
 
-        # 硬约束：限制在合理范围
-        temporal_weight = torch.clamp(temporal_weight, min=0.15, max=0.85)
-
-        # ===== v7 Step7: 运动门控（仅控制Prompt整体权重）=====
-        # 【关键解耦】门控仅影响最终Prompt，不影响权重生成过程
-        if self.mode == 'fomaml':
-            # 元学习调制门控阈值
-            gate_threshold = 0.1 + self.gate_threshold_emb.squeeze(-1)  # [B, 1]
-        else:
-            gate_threshold = 0.1
-
-        motion_gate = 0.2 + 0.8 * torch.sigmoid(5.0 * (global_motion.squeeze(-1) - gate_threshold))  # [B, 1]
-
-        # ===== v7 Step8: 生成时序Prompt =====
+        # ===== v10 Step6: 生成时序Prompt（层自适应位置编码）=====
         if fused_feat is None:
             fused_feat = aligned_feat
         
         weighted_feat = temporal_weight.unsqueeze(-1) * fused_feat  # [B, N, C]
-
-        # 全局池化 + 投影
         temporal_global = weighted_feat.mean(dim=1, keepdim=True)  # [B, 1, C]
         temporal_base = self.temporal_proj(temporal_global)  # [B, 1, C]
 
-        # 扩展到num_prompt_tokens个token
-        temporal_prompt = temporal_base.expand(-1, self.num_prompt_tokens, -1)  # [B, num_prompt_tokens, C]
-        temporal_prompt = temporal_prompt + self.pos_encoding
+        temporal_prompt = temporal_base.expand(-1, self.num_prompt_tokens, -1)
+        
+        layer_pos_bias = self.layer_pos_bias[layer_idx].unsqueeze(0)  # [1, 1, C]
+        temporal_prompt = temporal_prompt + self.pos_encoding + layer_pos_bias
 
-        # ===== v7 Step9: 应用运动门控（仅控制Prompt整体权重）=====
-        # 【关键解耦】门控乘在最终Prompt上，不影响权重生成
         temporal_prompt = motion_gate.unsqueeze(-1) * temporal_prompt
 
-        # 安全校验
         if torch.isnan(temporal_prompt).any():
             temporal_prompt = torch.zeros_like(temporal_prompt)
         if torch.isinf(temporal_prompt).any():
             temporal_prompt = torch.clamp(temporal_prompt, min=-10.0, max=10.0)
+
+        # ===== v10 Step7: 记录当前层权重（用于层间差异约束）=====
+        self._prev_layer_weights[layer_id] = temporal_weight.detach().clone()
+
+        layer_divergence = 0.0
+        if layer_id > 0 and (layer_id - 1) in self._prev_layer_weights:
+            prev_layer_weight = self._prev_layer_weights[layer_id - 1]
+            if prev_layer_weight.shape == temporal_weight.shape:
+                layer_divergence = torch.mean((temporal_weight - prev_layer_weight) ** 2).item()
 
         # ===== 可视化记录 =====
         vis = PromptVisualizer.get()
         if self.training:
             vis.log_prompt_stats('Temporal', temporal_prompt, temporal_weight)
             vis.log_grad_norm('Temporal', self)
-            # v7：记录关键指标
             vis.log_scalar('Temporal/global_motion', global_motion.mean().item())
             vis.log_scalar('Temporal/motion_gate', motion_gate.mean().item())
             vis.log_scalar('Temporal/temporal_weight_mean', temporal_weight.mean().item())
             vis.log_scalar('Temporal/weight_deviation', (temporal_weight - 0.5).abs().mean().item())
-            vis.log_scalar('Temporal/motion_modulation_range', (token_motion_norm.max() - token_motion_norm.min()).item())
+            vis.log_scalar(f'Temporal/layer{layer_id}_weight_mean', temporal_weight.mean().item())
+            vis.log_scalar(f'Temporal/layer{layer_id}_divergence', layer_divergence)
+            vis.log_scalar('Temporal/noise_std', noise_std if self.training else 0.0)
 
         if return_intermediate:
             intermediates = {
                 'temporal_weight': temporal_weight,
                 'global_motion': global_motion,
                 'motion_gate': motion_gate,
-                'token_motion_norm': token_motion_norm,
+                'layer_id': layer_id,
+                'layer_divergence': layer_divergence,
+                '_debug_valid': True,
             }
             return temporal_prompt, temporal_weight, intermediates
 
@@ -1212,7 +1193,32 @@ class PromptGenerator(nn.Module):
         self.num_prompt_tokens = config.get('NUM_PROMPT_TOKENS', 8)
         self.hidden_dim = config.get('HIDDEN_DIM', 256)
         self.mode = config.get('MODE', 'fixed')
-        self.meta_mode = config.get('META_MODE', 'standard')  # standard/fomaml - Prompt生成器模式
+        self.meta_mode = config.get('META_MODE', 'standard')
+        
+        # 【v15协同】协同策略配置
+        # independent: 独立计算，简单相加
+        # temporal_modulate: 时序动态调制一致性
+        # bidirectional: 双向交互调制
+        # gating: 门控自适应融合
+        # temporal_modulate_anneal: 时序调制+动态温度退火（v17新增）
+        # gating_modulate_hybrid: 门控+调制混合策略（v17新增）
+        # gating_token_level: Token级门控（v17新增）
+        self.coop_strategy = config.get('COOP_STRATEGY', 'temporal_modulate')
+        
+        # 【v17新增】动态温度退火计数器（用于temporal_modulate_anneal策略）
+        self._coop_step = 0
+        
+        # 【v15协同】协同门控参数（用于gating策略）
+        if self.coop_strategy == 'gating':
+            self.coop_gate = nn.Parameter(torch.ones(1) * 0.5)  # 可学习门控权重
+        
+        # 【v17新增】门控MLP（用于gating_modulate_hybrid和gating_token_level策略）
+        if self.coop_strategy in ['gating_modulate_hybrid', 'gating_token_level']:
+            self.coop_gate_mlp = nn.Sequential(
+                nn.Linear(self.embed_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, 2)
+            )
 
         self.enable_base = config.get('ENABLE_BASE', True)
         self.enable_mask = config.get('ENABLE_MASK', True)
@@ -1254,6 +1260,10 @@ class PromptGenerator(nn.Module):
         # 【v14】注入层数信息（用于自适应注入强度）
         self.inject_layers = config.get('META_PROMPT_INJECT_LAYERS', [])
         self._current_inject_layer = 0
+        
+        # 【v15协同】独立的时序注入层配置
+        # 如果未设置，则默认与META_PROMPT_INJECT_LAYERS相同
+        self.temporal_inject_layers = config.get('TEMPORAL_PROMPT_INJECT_LAYERS', self.inject_layers)
 
     @property
     def total_prompt_len(self):
@@ -1329,33 +1339,221 @@ class PromptGenerator(nn.Module):
         temporal_prompt = None
         temporal_weight = None
         if self.enable_temporal and self.temporal_generator is not None:
-            # 计算融合特征（用于时序Prompt生成）
-            fused_feat = (rgb_feat + tir_feat) / 2.0
+            # 【v15协同】检查当前层是否在时序注入层列表中
+            current_layer_id = getattr(self, '_current_inject_layer', 0)
+            should_inject_temporal = current_layer_id in self.temporal_inject_layers
+            
+            if should_inject_temporal:
+                fused_feat = (rgb_feat + tir_feat) / 2.0
 
-            # 调用v5时序模块，传入token_consistency
-            temporal_prompt, temporal_weight, temporal_intermediates = self.temporal_generator(
-                rgb_feat, tir_feat,
-                prev_state=None,
-                prev_features=prev_features,
-                token_consistency=token_consistency,
-                fused_feat=fused_feat
-            )
+                # 调用v10时序模块，传入layer_id实现层自适应
+                # 【关键修复】必须传return_intermediate=True，否则正则化无法生效
+                temporal_prompt, temporal_weight, temporal_intermediates = self.temporal_generator(
+                    rgb_feat, tir_feat,
+                    prev_state=None,
+                    prev_features=prev_features,
+                    token_consistency=token_consistency,
+                    fused_feat=fused_feat,
+                    layer_id=current_layer_id,
+                    return_intermediate=True  # 【v10修复】确保返回intermediates供正则化使用
+                )
 
-            if temporal_prompt is not None:
-                if temporal_intermediates is not None:
-                    intermediates['temporal_intermediates'] = temporal_intermediates
+                if temporal_prompt is not None:
+                    if temporal_intermediates is not None:
+                        intermediates['temporal_intermediates'] = temporal_intermediates
 
-        # ===== v5核心：三提示协同（时序权重动态调整）=====
-        # 当目标快速运动/遮挡时（temporal_weight大），降低Consistency权重，增加Mask权重
-        if temporal_weight is not None and self.enable_temporal:
-            # 计算全局时序强度
-            temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)  # [B, 1, 1]
-
-            # 动态调整Consistency和Mask的权重
-            if consistency_prompt is not None:
-                consistency_prompt = consistency_prompt * (1.0 - 0.2 * temporal_strength)
-            if mask_prompt is not None:
-                mask_prompt = mask_prompt * (1.0 + 0.2 * temporal_strength)
+        # ===== 【v15核心】多策略协同系统（支持任意单提示开关 + 元学习模式适配）=====
+        # 协同策略仅在两种或以上提示同时启用时生效
+        # 当某个提示被关闭时，自动跳过相关协同逻辑
+        # 元学习模式(fomaml)下，各生成器已有task_emb，协同策略不干预
+        
+        # 检测哪些提示可用
+        has_consistency = consistency_prompt is not None and self.enable_consistency
+        has_temporal = temporal_prompt is not None and self.enable_temporal
+        has_mask = mask_prompt is not None and self.enable_mask
+        
+        # 记录协同状态用于调试和分析
+        intermediates['coop_status'] = {
+            'has_consistency': has_consistency,
+            'has_temporal': has_temporal,
+            'has_mask': has_mask,
+            'meta_mode': self.meta_mode,
+            'strategy': self.coop_strategy
+        }
+        
+        # ===== 双提示协同（Consistency + Temporal）=====
+        if has_consistency and has_temporal:
+            if self.coop_strategy == 'independent':
+                pass
+            
+            elif self.coop_strategy == 'temporal_modulate':
+                # 【v16修复】保护性时序调制
+                # 原问题: 单向压制导致consistency持续被削弱，TIR权重降至0.08
+                # 修复方案:
+                #   1. 降低调制系数(0.2→0.08)，减少压制强度
+                #   2. 添加对称保护：只在极端情况下才调整
+                #   3. 限制调制范围[0.9, 1.05]，防止过度压制或增强
+                
+                temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
+                
+                # 计算调制因子，限制在安全范围
+                modulate_factor = 1.0 - 0.08 * temporal_strength
+                modulate_factor = torch.clamp(modulate_factor, min=0.90, max=1.05)
+                
+                consistency_prompt = consistency_prompt * modulate_factor
+                
+                # 【v16调试】记录调制信息用于分析
+                intermediates['coop_modulate_factor'] = modulate_factor.mean().item()
+                intermediates['coop_temporal_strength_raw'] = temporal_strength.mean().item()
+            
+            elif self.coop_strategy == 'bidirectional':
+                # 【v16修复】保护性双向交互调制
+                # 原问题: 双向压制形成负反馈循环，consistency被持续削弱
+                # 修复方案:
+                #   1. 降低双向调制系数(0.2→0.06)
+                #   2. 添加安全范围限制
+                #   3. 防止极端值导致的恶性循环
+                
+                temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
+                
+                # 时序调制一致性（降低系数+范围限制）
+                consistency_modulate = 1.0 - 0.06 * temporal_strength
+                consistency_modulate = torch.clamp(consistency_modulate, min=0.92, max=1.03)
+                consistency_prompt = consistency_prompt * consistency_modulate
+                
+                # 一致性调制时序（只在token_consistency有效时）
+                if token_consistency is not None:
+                    consistency_strength = token_consistency.mean(dim=1, keepdim=True).unsqueeze(-1)
+                    
+                    # 一致性调制时序（降低系数+范围限制）
+                    temporal_modulate = 0.97 + 0.06 * consistency_strength
+                    temporal_modulate = torch.clamp(temporal_modulate, min=0.95, max=1.05)
+                    temporal_prompt = temporal_prompt * temporal_modulate
+                
+                # 【v16调试】记录双向调制信息
+                intermediates['coop_consistency_modulate'] = consistency_modulate.mean().item()
+                if token_consistency is not None:
+                    intermediates['coop_temporal_modulate'] = temporal_modulate.mean().item()
+            
+            elif self.coop_strategy == 'gating':
+                if hasattr(self, 'coop_gate'):
+                    gate = torch.sigmoid(self.coop_gate)
+                    consistency_prompt = consistency_prompt * gate
+                    temporal_prompt = temporal_prompt * (1.0 - gate)
+            
+            elif self.coop_strategy == 'joint_regularize':
+                # 【v16修复】保护性联合正则化调制
+                # 原问题: 调制系数0.15仍然过大
+                # 修复方案: 降低至0.05，几乎不影响consistency
+                
+                temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
+                
+                # 极轻微的调制（几乎不调整）
+                modulate_factor = 1.0 - 0.05 * temporal_strength
+                modulate_factor = torch.clamp(modulate_factor, min=0.95, max=1.02)
+                
+                consistency_prompt = consistency_prompt * modulate_factor
+                intermediates['coop_temporal_strength'] = temporal_strength
+                intermediates['coop_strategy'] = 'joint_regularize'
+                intermediates['coop_modulate_factor'] = modulate_factor.mean().item()
+            
+            elif self.coop_strategy == 'temporal_modulate_anneal':
+                # 【v17新增】时序调制+动态温度退火
+                # 核心思想：训练初期弱调制，后期强调制，避免早期负反馈
+                # 温度退火策略：
+                #   - 前2000步：modulate_coeff=0.02（几乎不调制）
+                #   - 2000-8000步：线性升到0.12
+                #   - 8000步后：固定0.12
+                
+                if self.training:
+                    self._coop_step += 1
+                step = self._coop_step
+                
+                # 动态温度退火
+                if step < 2000:
+                    modulate_coeff = 0.02
+                elif step < 8000:
+                    modulate_coeff = 0.02 + (step - 2000) * (0.10 / 6000)
+                else:
+                    modulate_coeff = 0.12
+                
+                temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
+                
+                # 用动态系数计算调制因子
+                modulate_factor = 1.0 - modulate_coeff * temporal_strength
+                modulate_factor = torch.clamp(modulate_factor, min=0.90, max=1.05)
+                
+                consistency_prompt = consistency_prompt * modulate_factor
+                
+                # 记录调试信息
+                intermediates['coop_anneal_step'] = step
+                intermediates['coop_anneal_coeff'] = modulate_coeff
+                intermediates['coop_modulate_factor'] = modulate_factor.mean().item()
+                intermediates['coop_temporal_strength_raw'] = temporal_strength.mean().item()
+            
+            elif self.coop_strategy == 'gating_modulate_hybrid':
+                # 【v17新增】门控+调制混合策略
+                # 核心思想：门控自适应学习 + 时序调制物理先验
+                # 第一步：门控MLP生成初始门控
+                # 第二步：用时序强度微调门控
+                # 第三步：用微调后的门控融合
+                
+                if hasattr(self, 'coop_gate_mlp'):
+                    # 用search特征生成门控
+                    gate_input = x_search.mean(dim=1)  # [B, C]
+                    gate_logits = self.coop_gate_mlp(gate_input)  # [B, 2]
+                    gate = F.softmax(gate_logits, dim=-1)  # [B, 2]
+                    
+                    # 时序强度微调门控
+                    temporal_strength = temporal_weight.mean(dim=1)  # [B]
+                    # 时序强度高时，稍微降低一致性门控，提高时序门控
+                    gate_adjust = 0.05 * temporal_strength.unsqueeze(-1)  # [B, 1]
+                    gate[:, 0:1] = gate[:, 0:1] * (1.0 - gate_adjust)
+                    gate[:, 1:2] = gate[:, 1:2] * (1.0 + gate_adjust)
+                    # 重新归一化
+                    gate = gate / (gate.sum(dim=-1, keepdim=True) + 1e-8)
+                    
+                    # 用微调后的门控融合
+                    consistency_prompt = consistency_prompt * gate[:, 0:1].unsqueeze(1)
+                    temporal_prompt = temporal_prompt * gate[:, 1:2].unsqueeze(1)
+                    
+                    # 记录调试信息
+                    intermediates['coop_gate'] = gate.mean(dim=0).tolist()
+                    intermediates['coop_temporal_strength_raw'] = temporal_strength.mean().item()
+            
+            elif self.coop_strategy == 'gating_token_level':
+                # 【v17新增】Token级门控
+                # 核心思想：每个token独立门控，更精细的自适应融合
+                
+                if hasattr(self, 'coop_gate_mlp'):
+                    B, N, C = x_search.shape
+                    
+                    # Token级门控：每个token生成独立门控
+                    gate_logits = self.coop_gate_mlp(x_search)  # [B, N, 2]
+                    gate = F.softmax(gate_logits, dim=-1)  # [B, N, 2]
+                    
+                    # Token级融合
+                    consistency_prompt = consistency_prompt * gate[:, :, 0:1]
+                    temporal_prompt = temporal_prompt * gate[:, :, 1:2]
+                    
+                    # 记录调试信息
+                    intermediates['coop_gate_mean'] = gate.mean(dim=1).mean(dim=0).tolist()
+                    intermediates['coop_gate_std'] = gate.std(dim=1).mean().item()
+        
+        # ===== 三提示协同（Mask + Consistency + Temporal）=====
+        # 当三个提示都启用时，Mask会被时序强度动态调整
+        if has_mask and has_temporal:
+            temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
+            
+            # 【v16修复】保护性Mask调制
+            # 原问题: 0.2系数过大，导致Mask在运动大时过度增强
+            # 修复方案: 降低系数+限制范围
+            
+            mask_modulate = 1.0 + 0.08 * temporal_strength
+            mask_modulate = torch.clamp(mask_modulate, min=0.97, max=1.08)
+            
+            mask_prompt = mask_prompt * mask_modulate
+            intermediates['coop_mask_modulate'] = mask_modulate.mean().item()
 
         # 构建prompt_list
         if mask_prompt is not None:

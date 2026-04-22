@@ -1,10 +1,17 @@
 # ============================================================
-# 实验7_temporal_layer6: Temporal Prompt 单层注入第6层
+# 实验15_gating_modulate_hybrid: 门控+调制混合策略
 # ============================================================
-# 【实验目的】验证v5时序提示在中层注入效果
+# 【实验目的】验证门控自适应学习+时序调制物理先验的混合效果
 # 【训练方式】标准训练(无FOMAML)
-# 【注入层数】Base: [0], Temporal: [6]
-# 【v5创新】跨模态-时序联合一致性建模（复用Consistency权重）
+# 【注入层数】
+#   - Base: [0]
+#   - Consistency: [5, 6, 7, 8, 9] (最优)
+#   - Temporal: [5, 6, 7, 8] (最优)
+# 【协同策略】gating_modulate_hybrid - 门控+调制混合
+#   - 第一步: 门控MLP生成初始门控 (自适应学习)
+#   - 第二步: 用时序强度微调门控 (物理先验)
+#   - 第三步: 用微调后的门控融合
+#   - 微调系数: 0.05 (温和调整，不破坏门控已学到的东西)
 # ============================================================
 
 DATA:
@@ -55,8 +62,10 @@ MODEL:
     META_PROMPT: True
     CONSISTENCY_VERSION: 'fusion'
     BASE_PROMPT_INJECT_LAYERS: [0]
-    META_PROMPT_INJECT_LAYERS: [6]
-    META_ENABLE_CONSISTENCY: False
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
+    COOP_STRATEGY: 'gating_modulate_hybrid'
+    META_ENABLE_CONSISTENCY: True
     META_ENABLE_MASK: False
     META_ENABLE_TEMPORAL: True
     ENABLE_CROSS_ATTN: True
@@ -71,12 +80,12 @@ TRAIN:
   DROP_PATH_RATE: 0.1
   CE_START_EPOCH: 4
   CE_WARM_EPOCH: 16
-  BATCH_SIZE: 96
+  BATCH_SIZE: 48
   EPOCH: 60
   GIOU_WEIGHT: 3.0
   L1_WEIGHT: 4.0
   GRAD_CLIP_NORM: 0.5
-  LR: 0.0012
+  LR: 0.0006
   LR_DROP_EPOCH: 48
   NUM_WORKER: 16
   OPTIMIZER: ADAMW

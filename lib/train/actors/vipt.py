@@ -199,35 +199,63 @@ class ViPTActor(BaseActor):
                 else:
                     current_reg_loss = 0.0
 
-                # ===== 【v7核心】运动感知熵正则化（时序模块专用）=====
-                # 【修复正则化公式写反的bug】
-                # 正确逻辑：熵越高（权重越接近0.5），正则化损失越大
-                # 当权重全=0.5时，熵=log(2)≈0.693，正则化损失最大
-                # 当权重有区分度时，熵<0.693，正则化损失减小
-                if 'temporal_intermediates' in intermediates and intermediates['temporal_intermediates'] is not None:
-                    temporal_data = intermediates['temporal_intermediates']
-                    if 'temporal_weight' in temporal_data and 'global_motion' in temporal_data:
-                        temporal_weight = temporal_data['temporal_weight']  # [B, N]
-                        global_motion = temporal_data['global_motion']  # [B, 1, 1]
-                        
-                        # 计算熵
-                        p = temporal_weight
-                        entropy = - (p * torch.log(p + 1e-8) + (1 - p) * torch.log(1 - p + 1e-8))
-                        
-                        # 运动感知正则化权重：运动越大，正则化越强
-                        reg_weight = 0.01 + 0.03 * global_motion.squeeze(-1)  # [B, 1]
-                        
-                        # 【修复】熵正则化：惩罚高熵（权重接近0.5）
-                        # 正确公式：entropy / 0.693（熵越高，损失越大）
-                        temporal_reg_loss = reg_weight * (torch.mean(entropy, dim=1, keepdim=True) / 0.693)
-                        temporal_reg_loss = temporal_reg_loss.mean()
-                        
-                        loss = loss + 0.03 * temporal_reg_loss
-                        current_temporal_reg = temporal_reg_loss.item()
-                    else:
-                        current_temporal_reg = 0.0
+        # ===== 【v10.2核心】时序正则化（移到循环外，避免变量覆盖）=====
+        # 【致命Bug修复】原代码在循环内部检查 'temporal_intermediates' in intermediates
+        # 但intermediates是循环变量，第3次迭代时它本身就是temporal_intermediates
+        # 导致条件判断永远为False，正则化从未执行！
+        current_temporal_reg = 0.0
+        
+        # 【v15调试】记录每一步的状态，用于定位问题
+        _debug_step = getattr(self, '_debug_reg_step', 0)
+        self._debug_reg_step = _debug_step + 1
+        
+        if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
+            inject_intermediates = pred_dict['inject_intermediates']
+            
+            # 【关键修复】直接从父字典获取，不依赖循环变量
+            if 'temporal_intermediates' in inject_intermediates and inject_intermediates['temporal_intermediates'] is not None:
+                temporal_data = inject_intermediates['temporal_intermediates']
+                
+                _debug_ok = temporal_data.get('_debug_valid', False)
+                
+                if 'temporal_weight' in temporal_data and 'global_motion' in temporal_data and _debug_ok:
+                    temporal_weight = temporal_data['temporal_weight']
+                    global_motion = temporal_data['global_motion']
+
+                    global_mean = torch.mean(temporal_weight, dim=1, keepdim=True)
+                    mean_reg = torch.mean((global_mean - 0.5) ** 2)
+
+                    temporal_reg_loss = mean_reg
+                    loss = loss + 0.1 * temporal_reg_loss
+                    current_temporal_reg = temporal_reg_loss.item()
+                    
+                    # 【v15调试】每100步打印一次状态
+                    if _debug_step % 100 == 0:
+                        print(f"[DEBUG REG Step {_debug_step}] temporal_reg={current_temporal_reg:.6f}, "
+                              f"weight_mean={global_mean.mean().item():.4f}, motion={global_motion.mean().item():.4f}")
                 else:
-                    current_temporal_reg = 0.0
+                    # 【v15调试】打印失败原因
+                    if _debug_step <= 5 or _debug_step % 500 == 0:
+                        has_weight = 'temporal_weight' in temporal_data
+                        has_motion = 'global_motion' in temporal_data
+                        debug_valid = _debug_ok
+                        keys = list(temporal_data.keys())[:5]
+                        print(f"[DEBUG REG FAIL Step {_debug_step}] has_weight={has_weight}, "
+                              f"has_motion={has_motion}, valid={debug_valid}, keys={keys}")
+            else:
+                # 【v15调试】打印intermediates结构
+                if _debug_step <= 3:
+                    has_temporal = 'temporal_intermediates' in inject_intermediates
+                    temporal_is_none = inject_intermediates.get('temporal_intermediates') is None if has_temporal else True
+                    all_keys = list(inject_intermediates.keys())[:10] if inject_intermediates else []
+                    print(f"[DEBUG NO TEMPORAL Step {_debug_step}] has_temporal_key={has_temporal}, "
+                          f"is_none={temporal_is_none}, all_keys={all_keys}")
+        else:
+            # 【v15调试】检查pred_dict是否有inject_intermediates
+            if _debug_step <= 2:
+                has_inject = 'inject_intermediates' in pred_dict
+                inject_val = pred_dict.get('inject_intermediates')
+                print(f"[DEBUG NO INJECT Step {_debug_step}] has_inject_key={has_inject}, val_type={type(inject_val)}")
 
         if return_status:
             mean_iou = iou.detach().mean()

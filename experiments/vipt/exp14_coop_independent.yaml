@@ -1,10 +1,13 @@
 # ============================================================
-# 实验7_temporal_layer9: Temporal Prompt 单层注入第9层
+# 实验14_coop_independent: 协同策略A - 独立协同
 # ============================================================
-# 【实验目的】验证v5时序提示在超高层注入效果
+# 【实验目的】验证一致性+时序独立协同效果（基线）
 # 【训练方式】标准训练(无FOMAML)
-# 【注入层数】Base: [0], Temporal: [9]
-# 【v5创新】跨模态-时序联合一致性建模（复用Consistency权重）
+# 【注入层数】
+#   - Base: [0]
+#   - Consistency: [5, 6, 7, 8, 9] (最优)
+#   - Temporal: [5, 6, 7, 8] (最优)
+# 【协同策略】independent - 独立计算，简单相加，无交互
 # ============================================================
 
 DATA:
@@ -55,8 +58,10 @@ MODEL:
     META_PROMPT: True
     CONSISTENCY_VERSION: 'fusion'
     BASE_PROMPT_INJECT_LAYERS: [0]
-    META_PROMPT_INJECT_LAYERS: [9]
-    META_ENABLE_CONSISTENCY: False
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
+    COOP_STRATEGY: 'independent'
+    META_ENABLE_CONSISTENCY: True
     META_ENABLE_MASK: False
     META_ENABLE_TEMPORAL: True
     ENABLE_CROSS_ATTN: True
@@ -71,12 +76,12 @@ TRAIN:
   DROP_PATH_RATE: 0.1
   CE_START_EPOCH: 4
   CE_WARM_EPOCH: 16
-  BATCH_SIZE: 96
+  BATCH_SIZE: 48
   EPOCH: 60
   GIOU_WEIGHT: 3.0
   L1_WEIGHT: 4.0
   GRAD_CLIP_NORM: 0.5
-  LR: 0.0012
+  LR: 0.0006
   LR_DROP_EPOCH: 48
   NUM_WORKER: 16
   OPTIMIZER: ADAMW

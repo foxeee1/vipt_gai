@@ -1,10 +1,18 @@
 # ============================================================
-# 实验7_temporal_layers6_7_8: Temporal Prompt 三层注入第6,7,8层
+# 实验15_temporal_modulate_anneal: 时序调制+动态温度退火
 # ============================================================
-# 【实验目的】验证v5时序提示三层注入效果（边际收益验证）
+# 【实验目的】验证动态温度退火能否修复时序调制的硬编码缺陷
 # 【训练方式】标准训练(无FOMAML)
-# 【注入层数】Base: [0], Temporal: [6, 7, 8]
-# 【v5创新】跨模态-时序联合一致性建模（复用Consistency权重）
+# 【注入层数】
+#   - Base: [0]
+#   - Consistency: [5, 6, 7, 8, 9] (最优)
+#   - Temporal: [5, 6, 7, 8] (最优)
+# 【协同策略】temporal_modulate_anneal - 时序调制+动态温度退火
+#   - 温度退火策略:
+#     - 前2000步: modulate_coeff=0.02 (几乎不调制)
+#     - 2000-8000步: 线性升到0.12
+#     - 8000步后: 固定0.12
+#   - 核心思想: 训练初期弱调制，后期强调制，避免早期负反馈
 # ============================================================
 
 DATA:
@@ -55,8 +63,10 @@ MODEL:
     META_PROMPT: True
     CONSISTENCY_VERSION: 'fusion'
     BASE_PROMPT_INJECT_LAYERS: [0]
-    META_PROMPT_INJECT_LAYERS: [6, 7, 8]
-    META_ENABLE_CONSISTENCY: False
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
+    COOP_STRATEGY: 'temporal_modulate_anneal'
+    META_ENABLE_CONSISTENCY: True
     META_ENABLE_MASK: False
     META_ENABLE_TEMPORAL: True
     ENABLE_CROSS_ATTN: True
@@ -71,12 +81,12 @@ TRAIN:
   DROP_PATH_RATE: 0.1
   CE_START_EPOCH: 4
   CE_WARM_EPOCH: 16
-  BATCH_SIZE: 64
+  BATCH_SIZE: 48
   EPOCH: 60
   GIOU_WEIGHT: 3.0
   L1_WEIGHT: 4.0
   GRAD_CLIP_NORM: 0.5
-  LR: 0.0008
+  LR: 0.0006
   LR_DROP_EPOCH: 48
   NUM_WORKER: 16
   OPTIMIZER: ADAMW

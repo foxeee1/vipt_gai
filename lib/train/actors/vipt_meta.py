@@ -62,6 +62,9 @@ class ViPTMetaActor(BaseActor):
         # 【v8.1】Support正则化权重: 外环loss = query_loss + support_reg * support_loss
         self.support_reg_weight = getattr(cfg.TRAIN.META, 'SUPPORT_REG_WEIGHT', 0.3)
 
+        # 【v17新增】对比学习损失开关（用于gating_token_level策略）
+        self.enable_contrast_loss = getattr(cfg.TRAIN.META, 'ENABLE_CONTRAST_LOSS', False)
+
         # 【方案A】Health Score监控状态 (仅用于监控, 不驱动训练参数!)
         self._adaptive_state = {
             'iou_window': deque(maxlen=80),
@@ -1059,8 +1062,9 @@ class ViPTMetaActor(BaseActor):
         if hasattr(net_backbone, 'meta_prompt_generator') and net_backbone.meta_prompt_generator is not None:
             for name, param in net_backbone.meta_prompt_generator.named_parameters():
                 if param.requires_grad:
-                    meta_params[name] = param
-                    meta_names.append(name)
+                    full_name = 'meta_prompt_generator.' + name
+                    meta_params[full_name] = param
+                    meta_names.append(full_name)
 
         if len(meta_params) == 0 and hasattr(net_backbone, 'prompt_blocks'):
             for name, param in net_backbone.prompt_blocks.named_parameters():
@@ -1180,7 +1184,7 @@ class ViPTMetaActor(BaseActor):
                             return_last_attn=False)
 
         from lib.models.vipt.meta_prompt import PromptVisualizer
-        if self.training:
+        if self.net.training:
             PromptVisualizer.increment_step()
         return out_dict
 
@@ -1245,6 +1249,33 @@ class ViPTMetaActor(BaseActor):
                 self.loss_weight['l1'] * l1_loss +
                 self.loss_weight['focal'] * location_loss)
 
+        # 【v17新增】对比学习损失（用于gating_token_level策略）
+        # 核心思想：强制门控在不同场景下有不同的输出
+        # 运动大时，时序门控应该大；运动小时，一致性门控应该大
+        contrast_loss = torch.tensor(0.0, device=loss.device)
+        if 'aux_dict' in pred_dict and pred_dict['aux_dict'] is not None:
+            aux_dict = pred_dict['aux_dict']
+            if 'inject_intermediates' in aux_dict:
+                intermediates = aux_dict['inject_intermediates']
+                
+                # 检查是否启用对比学习损失
+                enable_contrast = getattr(self, 'enable_contrast_loss', False)
+                if enable_contrast and 'coop_gate_mean' in intermediates:
+                    gate_mean = intermediates['coop_gate_mean']  # [consistency_gate, temporal_gate]
+                    temporal_strength = intermediates.get('coop_temporal_strength_raw', None)
+                    
+                    if temporal_strength is not None and isinstance(temporal_strength, torch.Tensor):
+                        # 场景标签：时序强度>0.5为运动大场景
+                        scene_label = (temporal_strength > 0.5).float()
+                        
+                        # 对比学习损失：时序门控应该与场景标签一致
+                        temporal_gate = torch.tensor(gate_mean[1], device=loss.device)
+                        contrast_loss = F.binary_cross_entropy(
+                            temporal_gate.unsqueeze(0), 
+                            scene_label.mean().unsqueeze(0)
+                        )
+                        loss = loss + 0.05 * contrast_loss
+
         if return_status:
             mean_iou = iou.detach().mean()
             pred_cx = (pred_boxes_vec[:, 0] + pred_boxes_vec[:, 2]) / 2
@@ -1258,6 +1289,7 @@ class ViPTMetaActor(BaseActor):
                 "Loss/giou": giou_loss.item(),
                 "Loss/l1": l1_loss.item(),
                 "Loss/location": location_loss.item(),
+                "Loss/contrast": contrast_loss.item(),
                 "IoU": mean_iou.item(),
                 "CenterDist": center_dist,
             }
