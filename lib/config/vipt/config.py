@@ -53,6 +53,12 @@ cfg.MODEL.HEAD.NUM_CHANNELS = 256
 
 # TRAIN
 cfg.TRAIN = edict()
+# 【v20分阶段训练】使用STAGE配置控制冻结
+# STAGE=0: 正常训练（不冻结）
+# STAGE=1: 固定Consistency，只训练Temporal
+# STAGE=2: 固定Temporal，只训练Consistency
+# STAGE=3: 联合微调（放开所有参数）
+cfg.TRAIN.STAGE = 0
 cfg.TRAIN.PROMPT = edict()
 cfg.TRAIN.PROMPT.TYPE = 'vipt_deep'  # vipt_deep vipt_shaw
 cfg.TRAIN.LR = 0.0001

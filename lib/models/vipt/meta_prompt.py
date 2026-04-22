@@ -24,6 +24,7 @@
 - 易于扩展：预留接口，方便后续添加新的Prompt模块
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1210,7 +1211,13 @@ class PromptGenerator(nn.Module):
         
         # 【v15协同】协同门控参数（用于gating策略）
         if self.coop_strategy == 'gating':
-            self.coop_gate = nn.Parameter(torch.ones(1) * 0.5)  # 可学习门控权重
+            self.coop_gate = nn.Parameter(torch.zeros(1))  # 【v18优化】无偏初始化，sigmoid(0)=0.5
+        
+        # 【v18新增】门控v2策略：特征调制门控
+        if self.coop_strategy == 'gating_v2':
+            self.coop_gate = nn.Parameter(torch.zeros(1))  # 无偏初始化
+            # 特征调制投影层：将门控信号投影到特征空间
+            self.gate_feat_proj = nn.Linear(self.embed_dim, self.embed_dim)
         
         # 【v17新增】门控MLP（用于gating_modulate_hybrid和gating_token_level策略）
         if self.coop_strategy in ['gating_modulate_hybrid', 'gating_token_level']:
@@ -1440,6 +1447,37 @@ class PromptGenerator(nn.Module):
                     gate = torch.sigmoid(self.coop_gate)
                     consistency_prompt = consistency_prompt * gate
                     temporal_prompt = temporal_prompt * (1.0 - gate)
+            
+            elif self.coop_strategy == 'gating_v2':
+                # 【v18新增】特征调制门控
+                # 核心改进：门控不只作用在Prompt上，而是直接调制特征融合
+                # 第一步：门控调制融合特征（rgb_feat和tir_feat的加权）
+                # 第二步：用调制后的特征重新生成Prompt
+                # 第三步：门控正则化（降低系数，不惩罚极端门控）
+                
+                if hasattr(self, 'coop_gate'):
+                    gate = torch.sigmoid(self.coop_gate)
+                    
+                    # 特征级调制：用门控加权rgb和tir特征
+                    # gate→consistency(rgb主导), (1-gate)→temporal(tir主导)
+                    modulated_rgb = rgb_feat * gate
+                    modulated_tir = tir_feat * (1.0 - gate)
+                    fused_feat = modulated_rgb + modulated_tir
+                    
+                    # 用调制后的特征投影生成调制信号
+                    gate_signal = torch.tanh(self.gate_feat_proj(fused_feat))  # [B, N, C]
+                    
+                    # 将调制信号融入Prompt
+                    consistency_prompt = consistency_prompt + 0.1 * gate_signal
+                    temporal_prompt = temporal_prompt - 0.1 * gate_signal
+                    
+                    # 门控正则化：计算门控熵，用于监控（不加入loss，避免约束）
+                    gate_val = gate.item()
+                    gate_entropy = -(gate_val * math.log(gate_val + 1e-8) + (1 - gate_val) * math.log(1 - gate_val + 1e-8))
+                    
+                    # 记录调试信息
+                    intermediates['coop_gate_value'] = gate_val
+                    intermediates['coop_gate_entropy'] = gate_entropy
             
             elif self.coop_strategy == 'joint_regularize':
                 # 【v16修复】保护性联合正则化调制

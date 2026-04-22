@@ -21,6 +21,48 @@ class ViPTActor(BaseActor):
         # 【v7】纯监控模式 — 无正则化状态变量
         # v7通过网络结构本身（位置引导+Gumbel-Softmax）保证双峰
         self._adaptive_reg_state = None
+        
+        # 【v20分阶段训练】模块冻结逻辑（使用STAGE配置）
+        if cfg is not None:
+            self._apply_freeze_settings()
+    
+    def _apply_freeze_settings(self):
+        """【v20】根据STAGE配置冻结指定模块"""
+        net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
+        
+        stage = getattr(self.cfg.TRAIN, 'STAGE', 0)
+        
+        if stage == 0:
+            return
+        
+        print(f"[v20分阶段训练] STAGE={stage}")
+        
+        if hasattr(net, 'backbone') and hasattr(net.backbone, 'meta_prompt_generator'):
+            meta_gen = net.backbone.meta_prompt_generator
+            
+            if stage == 1:
+                # stage1：固定Consistency，只训练Temporal
+                for name, param in net.named_parameters():
+                    if 'consistency_generator' in name:
+                        param.requires_grad = False
+                    else:
+                        param.requires_grad = True
+                print("[v20 STAGE1] Consistency模块已冻结，Temporal模块可训练")
+            
+            elif stage == 2:
+                # stage2：固定Temporal，只训练Consistency
+                for name, param in net.named_parameters():
+                    if 'temporal_generator' in name:
+                        param.requires_grad = False
+                    else:
+                        param.requires_grad = True
+                print("[v20 STAGE2] Temporal模块已冻结，Consistency模块可训练")
+            
+            elif stage == 3:
+                # stage3：放开所有参数，联合微调
+                for param in net.parameters():
+                    param.requires_grad = True
+                print("[v20 STAGE3] 所有参数已放开，联合微调")
 
     def fix_bns(self):
         net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
@@ -170,92 +212,58 @@ class ViPTActor(BaseActor):
                         batch_entropies.append(entropy)
                     current_weight_entropy = torch.stack(batch_entropies).mean().item()
 
-                # ===== 【v13核心】通用化三重正则化（不依赖数据集特性）=====
-                # 1. 反转正则化：惩罚token_weight与base_p过于接近（防止MLP偷懒输出0）
-                # 2. 熵正则化：确保双峰有区分度（惩罚单峰分布）
-                # 3. 方差正则化：确保token间有差异（惩罚所有token权重相同）
-                # 【关键】移除均值约束，不假设模态质量相当，适配任意数据集/模态
+                # ===== 【v20核心】修复RGB偏向问题 - 对称均值约束（降低强度）=====
+                # 问题：avg_rgb_weight=0.9, avg_tir_weight=0.1 → 模型全信RGB，忽略TIR
+                # 修复：强制平均权重在0.5附近，同时利用两个模态
+                # 【v20关键】降低均值约束强度(0.6→0.3)，让模型有足够区分度
                 if base_p is not None and token_weight is not None:
-                    # 反转正则化（30%权重）
-                    diff = torch.abs(token_weight - base_p)
-                    reverse_reg = 1.0 - diff.mean()
-
-                    # 熵正则化（40%权重）- 确保双峰有区分度
+                    # 【v20修复】对称均值约束（30%权重）- 强制双模态均衡利用
+                    global_mean = torch.mean(token_weight, dim=1)
+                    mean_reg = torch.mean((global_mean - 0.5) ** 2)
+                    
+                    # 熵正则化（70%权重）- 确保双峰有区分度
                     p = token_weight
                     entropy = - (p * torch.log(p + 1e-8) + (1 - p) * torch.log(1 - p + 1e-8))
                     target_entropy = 0.5
                     entropy_reg = torch.mean((entropy - target_entropy) ** 2)
-
-                    # 方差正则化（30%权重）- 确保token间有差异
-                    # 惩罚方差过小（所有token权重相同）
-                    weight_var = torch.var(token_weight, dim=1)
-                    target_var = 0.04
-                    var_reg = torch.mean((weight_var - target_var) ** 2)
-
-                    # 三重正则化联合
-                    consistency_reg_loss = 0.3 * reverse_reg + 0.4 * entropy_reg + 0.3 * var_reg
+                    
+                    # 【v20修复】总正则化：均值约束占30%，熵正则化占70%
+                    consistency_reg_loss = 0.3 * mean_reg + 0.7 * entropy_reg
                     loss = loss + 0.05 * consistency_reg_loss
                     current_reg_loss = consistency_reg_loss.item()
                 else:
                     current_reg_loss = 0.0
 
-        # ===== 【v10.2核心】时序正则化（移到循环外，避免变量覆盖）=====
-        # 【致命Bug修复】原代码在循环内部检查 'temporal_intermediates' in intermediates
-        # 但intermediates是循环变量，第3次迭代时它本身就是temporal_intermediates
-        # 导致条件判断永远为False，正则化从未执行！
+        # ===== 【v20核心】时序正则化（简化检查逻辑 + 降低强度）=====
+        # 问题：原条件检查过于复杂，导致正则化从未执行
+        # 修复：简化检查条件，只检查temporal_weight是否存在
+        # 【v20关键】降低均值约束强度，让模型有足够区分度
         current_temporal_reg = 0.0
-        
-        # 【v15调试】记录每一步的状态，用于定位问题
-        _debug_step = getattr(self, '_debug_reg_step', 0)
-        self._debug_reg_step = _debug_step + 1
         
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
             
-            # 【关键修复】直接从父字典获取，不依赖循环变量
             if 'temporal_intermediates' in inject_intermediates and inject_intermediates['temporal_intermediates'] is not None:
                 temporal_data = inject_intermediates['temporal_intermediates']
                 
-                _debug_ok = temporal_data.get('_debug_valid', False)
-                
-                if 'temporal_weight' in temporal_data and 'global_motion' in temporal_data and _debug_ok:
+                # 【v20简化】只检查temporal_weight是否存在
+                if 'temporal_weight' in temporal_data:
                     temporal_weight = temporal_data['temporal_weight']
-                    global_motion = temporal_data['global_motion']
 
+                    # 【v20修复】对称均值约束（30%权重）- 强制时序权重在0.5附近
                     global_mean = torch.mean(temporal_weight, dim=1, keepdim=True)
                     mean_reg = torch.mean((global_mean - 0.5) ** 2)
-
-                    temporal_reg_loss = mean_reg
-                    loss = loss + 0.1 * temporal_reg_loss
-                    current_temporal_reg = temporal_reg_loss.item()
                     
-                    # 【v15调试】每100步打印一次状态
-                    if _debug_step % 100 == 0:
-                        print(f"[DEBUG REG Step {_debug_step}] temporal_reg={current_temporal_reg:.6f}, "
-                              f"weight_mean={global_mean.mean().item():.4f}, motion={global_motion.mean().item():.4f}")
-                else:
-                    # 【v15调试】打印失败原因
-                    if _debug_step <= 5 or _debug_step % 500 == 0:
-                        has_weight = 'temporal_weight' in temporal_data
-                        has_motion = 'global_motion' in temporal_data
-                        debug_valid = _debug_ok
-                        keys = list(temporal_data.keys())[:5]
-                        print(f"[DEBUG REG FAIL Step {_debug_step}] has_weight={has_weight}, "
-                              f"has_motion={has_motion}, valid={debug_valid}, keys={keys}")
-            else:
-                # 【v15调试】打印intermediates结构
-                if _debug_step <= 3:
-                    has_temporal = 'temporal_intermediates' in inject_intermediates
-                    temporal_is_none = inject_intermediates.get('temporal_intermediates') is None if has_temporal else True
-                    all_keys = list(inject_intermediates.keys())[:10] if inject_intermediates else []
-                    print(f"[DEBUG NO TEMPORAL Step {_debug_step}] has_temporal_key={has_temporal}, "
-                          f"is_none={temporal_is_none}, all_keys={all_keys}")
-        else:
-            # 【v15调试】检查pred_dict是否有inject_intermediates
-            if _debug_step <= 2:
-                has_inject = 'inject_intermediates' in pred_dict
-                inject_val = pred_dict.get('inject_intermediates')
-                print(f"[DEBUG NO INJECT Step {_debug_step}] has_inject_key={has_inject}, val_type={type(inject_val)}")
+                    # 熵正则化（70%权重）- 确保时序权重有区分度
+                    tw = temporal_weight
+                    entropy = - (tw * torch.log(tw + 1e-8) + (1 - tw) * torch.log(1 - tw + 1e-8))
+                    target_entropy = 0.5
+                    entropy_reg = torch.mean((entropy - target_entropy) ** 2)
+
+                    # 【v20修复】总正则化：均值约束占30%，熵正则化占70%
+                    temporal_reg_loss = 0.3 * mean_reg + 0.7 * entropy_reg
+                    loss = loss + 0.05 * temporal_reg_loss  # 【v20降低权重】0.2→0.05
+                    current_temporal_reg = temporal_reg_loss.item()
 
         if return_status:
             mean_iou = iou.detach().mean()

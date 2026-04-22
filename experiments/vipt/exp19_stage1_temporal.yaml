@@ -1,0 +1,105 @@
+# ============================================================
+# 实验19_阶段1: 固定Consistency，只训练Temporal
+# ============================================================
+# 【训练策略】分阶段训练 - 阶段1
+#   - 固定Consistency模块参数
+#   - 只训练Temporal模块
+#   - 训练20个epoch
+# ============================================================
+
+DATA:
+  MAX_SAMPLE_INTERVAL: 200
+  MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  SEARCH:
+    CENTER_JITTER: 3
+    FACTOR: 4.0
+    SCALE_JITTER: 0.25
+    SIZE: 256
+    NUMBER: 1
+  TEMPLATE:
+    CENTER_JITTER: 0
+    FACTOR: 2.0
+    SCALE_JITTER: 0
+    SIZE: 128
+  TRAIN:
+    DATASETS_NAME:
+    - LasHeR_train
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 12000
+  VAL:
+    DATASETS_NAME:
+    - LasHeR_val
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 1000
+  XTYPE: 'rgbrgb'
+
+MODEL:
+  PRETRAIN_FILE: "./pretrained/OSTrack_ep0300_256.pth.tar"
+  EXTRA_MERGER: False
+  RETURN_INTER: False
+  BACKBONE:
+    TYPE: vit_base_patch16_224_ce_prompt
+    STRIDE: 16
+    CE_LOC: [3, 6, 9]
+    CE_KEEP_RATIO: [0.7, 0.7, 0.7]
+    CE_TEMPLATE_RANGE: 'CTR_POINT'
+    META_PROMPT: True
+    CONSISTENCY_VERSION: 'fusion'
+    BASE_PROMPT_INJECT_LAYERS: [0]
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
+    COOP_STRATEGY: 'independent'
+    META_ENABLE_CONSISTENCY: True
+    META_ENABLE_MASK: False
+    META_ENABLE_TEMPORAL: True
+    ENABLE_CROSS_ATTN: True
+    ENABLE_VIS: True
+    META_MODE: 'standard'
+    # 【v20分阶段训练】阶段1：固定Consistency，只训练Temporal
+    # STAGE=1: 固定Consistency，只训练Temporal
+  HEAD:
+    TYPE: CENTER
+    NUM_CHANNELS: 256
+
+TRAIN:
+  BACKBONE_MULTIPLIER: 0.1
+  DROP_PATH_RATE: 0.1
+  CE_START_EPOCH: 4
+  CE_WARM_EPOCH: 16
+  BATCH_SIZE: 48
+  EPOCH: 20
+  GIOU_WEIGHT: 3.0
+  L1_WEIGHT: 4.0
+  GRAD_CLIP_NORM: 0.5
+  LR: 0.0006
+  LR_DROP_EPOCH: 16
+  NUM_WORKER: 16
+  OPTIMIZER: ADAMW
+  PRINT_INTERVAL: 50
+  SCHEDULER:
+    TYPE: step
+    DECAY_RATE: 0.1
+  VAL_EPOCH_INTERVAL: 5
+  WEIGHT_DECAY: 0.0001
+  AMP: True
+  PROMPT:
+    TYPE: vipt_deep
+  FIX_BN: true
+  SAVE_EPOCH_INTERVAL: 10
+  SAVE_LAST_N_EPOCH: 1
+  # 【v20分阶段训练】STAGE=1: 固定Consistency，只训练Temporal
+  STAGE: 1
+  META:
+    ENABLE: False
+
+TEST:
+  EPOCH: 20
