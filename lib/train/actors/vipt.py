@@ -180,9 +180,18 @@ class ViPTActor(BaseActor):
 
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
+            
+            # 【v22调试】打印inject_intermediates的keys
+            if not getattr(self, '_inject_intermediates_debug_printed', False):
+                print(f"[DEBUG compute_losses] inject_intermediates keys: {list(inject_intermediates.keys())}")
+                self._inject_intermediates_debug_printed = True
 
             for key, intermediates in inject_intermediates.items():
                 if intermediates is None:
+                    continue
+                
+                # 【v22修复】跳过非字典类型的值（如alpha_consistency等浮点数）
+                if not isinstance(intermediates, dict):
                     continue
 
                 token_weight = None
@@ -192,6 +201,10 @@ class ViPTActor(BaseActor):
                     base_p = intermediates.get('base_p')
                     if base_p is not None:
                         base_p = base_p.squeeze(-1)
+                    # 【v22调试】打印consistency相关变量
+                    if not getattr(self, '_consistency_debug_printed', False):
+                        print(f"[DEBUG consistency] key={key}, token_weight shape={token_weight.shape if token_weight is not None else None}, base_p={'exists' if base_p is not None else 'None'}")
+                        self._consistency_debug_printed = True
                 elif 'token_reliability' in intermediates:
                     token_weight = intermediates['token_reliability'].squeeze(-1)
 
@@ -234,10 +247,12 @@ class ViPTActor(BaseActor):
                 else:
                     current_reg_loss = 0.0
 
-        # ===== 【v20核心】时序正则化（简化检查逻辑 + 降低强度）=====
-        # 问题：原条件检查过于复杂，导致正则化从未执行
-        # 修复：简化检查条件，只检查temporal_weight是否存在
-        # 【v20关键】降低均值约束强度，让模型有足够区分度
+        # ===== 【v22核心】时序正则化（只保留熵正则化，不限制平均权重）=====
+        # 【关键修复】Temporal的物理意义是运动自适应：
+        #   - 运动大时，当前帧权重高(0.7-0.8)
+        #   - 运动小时，历史帧权重高(0.3-0.4)
+        #   - 天然平均权重是0.6-0.7，强制0.5违背物理意义！
+        # 修复：完全去掉均值约束，只保留熵正则化确保权重有区分度
         current_temporal_reg = 0.0
         
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
@@ -246,24 +261,56 @@ class ViPTActor(BaseActor):
             if 'temporal_intermediates' in inject_intermediates and inject_intermediates['temporal_intermediates'] is not None:
                 temporal_data = inject_intermediates['temporal_intermediates']
                 
-                # 【v20简化】只检查temporal_weight是否存在
                 if 'temporal_weight' in temporal_data:
                     temporal_weight = temporal_data['temporal_weight']
 
-                    # 【v20修复】对称均值约束（30%权重）- 强制时序权重在0.5附近
-                    global_mean = torch.mean(temporal_weight, dim=1, keepdim=True)
-                    mean_reg = torch.mean((global_mean - 0.5) ** 2)
-                    
-                    # 熵正则化（70%权重）- 确保时序权重有区分度
+                    # 【v22调试】验证temporal_weight是否有梯度
+                    if not getattr(self, '_temporal_grad_debug_printed', False):
+                        has_grad = temporal_weight.requires_grad and temporal_weight.grad is not None
+                        print(f"[DEBUG temporal] requires_grad={temporal_weight.requires_grad}, has_grad={has_grad}, shape={temporal_weight.shape}")
+                        print(f"[DEBUG temporal] weight range: [{temporal_weight.min().item():.4f}, {temporal_weight.max().item():.4f}]")
+                        self._temporal_grad_debug_printed = True
+
+                    # 【v22修复】只保留熵正则化，不限制平均权重
+                    # 只惩罚权重没有区分度的情况（全0或全1）
                     tw = temporal_weight
                     entropy = - (tw * torch.log(tw + 1e-8) + (1 - tw) * torch.log(1 - tw + 1e-8))
                     target_entropy = 0.5
                     entropy_reg = torch.mean((entropy - target_entropy) ** 2)
 
-                    # 【v20修复】总正则化：均值约束占30%，熵正则化占70%
-                    temporal_reg_loss = 0.3 * mean_reg + 0.7 * entropy_reg
-                    loss = loss + 0.05 * temporal_reg_loss  # 【v20降低权重】0.2→0.05
+                    # 【v22修复】只用熵正则化，权重降到0.01，完全避免和主任务对抗
+                    temporal_reg_loss = entropy_reg
+                    loss = loss + 0.01 * temporal_reg_loss
                     current_temporal_reg = temporal_reg_loss.item()
+
+        # ===== 【v22核心】Mask正则化（防止RGB偏向摆烂）=====
+        # 问题：Mask模块avg_rgb_weight=0.75锁死，完全偏向RGB
+        # 修复：添加对称均值约束，强制双模态均衡利用
+        current_mask_reg = 0.0
+        
+        if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
+            inject_intermediates = pred_dict['inject_intermediates']
+            
+            if 'mask_intermediates' in inject_intermediates and inject_intermediates['mask_intermediates'] is not None:
+                mask_data = inject_intermediates['mask_intermediates']
+                
+                if 'token_reliability' in mask_data:
+                    token_reliability = mask_data['token_reliability'].squeeze(-1)
+
+                    # 【v22修复】对称均值约束（30%权重）- 强制模态权重在0.5附近
+                    global_mean = torch.mean(token_reliability, dim=1, keepdim=True)
+                    mean_reg = torch.mean((global_mean - 0.5) ** 2)
+                    
+                    # 熵正则化（70%权重）- 确保模态权重有区分度
+                    tr = token_reliability
+                    entropy = - (tr * torch.log(tr + 1e-8) + (1 - tr) * torch.log(1 - tr + 1e-8))
+                    target_entropy = 0.5
+                    entropy_reg = torch.mean((entropy - target_entropy) ** 2)
+
+                    # 【v22修复】总正则化：均值约束占30%，熵正则化占70%
+                    mask_reg_loss = 0.3 * mean_reg + 0.7 * entropy_reg
+                    loss = loss + 0.02 * mask_reg_loss  # 与temporal相同权重
+                    current_mask_reg = mask_reg_loss.item()
 
         if return_status:
             mean_iou = iou.detach().mean()
@@ -273,6 +320,7 @@ class ViPTActor(BaseActor):
                       "Loss/location": location_loss.item(),
                       "Loss/consistency_reg": current_reg_loss if 'current_reg_loss' in dir() else 0.0,
                       "Loss/temporal_reg": current_temporal_reg if 'current_temporal_reg' in dir() else 0.0,
+                      "Loss/mask_reg": current_mask_reg if 'current_mask_reg' in dir() else 0.0,
                       "Train/weight_var": current_weight_var if current_weight_var else 0.0,
                       "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
                       "IoU": mean_iou.item()}

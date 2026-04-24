@@ -36,6 +36,7 @@ cfg.MODEL.BACKBONE.CONSISTENCY_VERSION = 'fusion'  # gradient, covariance, fusio
 cfg.MODEL.BACKBONE.BASE_PROMPT_INJECT_LAYERS = []  # Base Prompt注入层，空列表表示使用默认
 cfg.MODEL.BACKBONE.META_PROMPT_INJECT_LAYERS = []  # 元提示注入层，空列表表示使用默认
 cfg.MODEL.BACKBONE.TEMPORAL_PROMPT_INJECT_LAYERS = []  # 【v15】时序提示独立注入层，空列表表示与META_PROMPT_INJECT_LAYERS相同
+cfg.MODEL.BACKBONE.MASK_PROMPT_INJECT_LAYERS = []  # 【v21】Mask提示独立注入层，空列表表示与META_PROMPT_INJECT_LAYERS相同
 # 【v15】协同策略配置
 cfg.MODEL.BACKBONE.COOP_STRATEGY = 'temporal_modulate'  # independent, temporal_modulate, bidirectional, gating, joint_regularize
 # 可视化配置

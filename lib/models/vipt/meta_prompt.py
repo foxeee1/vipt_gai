@@ -859,6 +859,12 @@ class TemporalPromptGenerator(nn.Module):
         
         if torch.isnan(token_consistency).any():
             token_consistency = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
+        
+        # 【v21修复】处理token_consistency的维度
+        # ConsistencyPromptGenerator返回[B, N, 1]，需要squeeze到[B, N]
+        if token_consistency.dim() == 3:
+            token_consistency = token_consistency.squeeze(-1)
+        
         token_consistency = torch.clamp(token_consistency, min=0.01, max=0.99)
         
         aligned_feat = token_consistency.unsqueeze(-1) * rgb_feat + (1 - token_consistency).unsqueeze(-1) * tir_feat
@@ -897,10 +903,10 @@ class TemporalPromptGenerator(nn.Module):
         # 【v10关键2】使用标准sigmoid（T=1.0），不使用可学习温度
         temporal_weight = torch.sigmoid(temporal_logits)
 
-        # 【v10关键3】硬clamp到[0.25, 0.75]，强制中间值区域
-        # 原理：如果模型想走极端(0或1)，会被强制拉回中间
-        # 这比宽范围clamp更有效，因为限制了模型的"逃避空间"
-        temporal_weight = torch.clamp(temporal_weight, min=0.25, max=0.75)
+        # 【v22修复】放宽clamp范围到[0.1, 0.9]，避免权重被锁死
+        # 原v10的[0.25, 0.75]太严格，导致权重无法学习到合理值
+        # Temporal的物理意义是运动自适应，天然权重应该在0.3-0.8范围
+        temporal_weight = torch.clamp(temporal_weight, min=0.1, max=0.9)
 
         # 更新训练步数计数器（用于正则化退火）
         if self.training:
@@ -973,6 +979,7 @@ class GatedFusion(nn.Module):
     【核心优化】
     1. 单类型Prompt时直接返回，避免不必要的门控计算
     2. 多类型时使用软门控加权融合
+    3. 【v21修复】支持可变数量的prompt输入
     """
     def __init__(self, num_prompt_types: int):
         super().__init__()
@@ -1005,6 +1012,10 @@ class GatedFusion(nn.Module):
         # 【优化】单类型Prompt直接返回，避免门控引入噪声
         if len(prompt_list) == 1:
             return prompt_list[0]
+
+        # 【v21修复】当prompt数量与初始化时不匹配，使用简单平均融合
+        if len(prompt_list) != self.num_prompt_types:
+            return sum(prompt_list) / len(prompt_list)
 
         concatenated = torch.cat(prompt_list, dim=1)
 
@@ -1213,6 +1224,13 @@ class PromptGenerator(nn.Module):
         if self.coop_strategy == 'gating':
             self.coop_gate = nn.Parameter(torch.zeros(1))  # 【v18优化】无偏初始化，sigmoid(0)=0.5
         
+        # 【v21新增】三提示门控融合
+        if self.coop_strategy == 'gating_triple':
+            # 三提示门控：Consistency, Temporal, Mask
+            # 初始化为[0.4, 0.35, 0.25]的logits，softmax后接近这个分布
+            # 使用zeros初始化，让模型自己学习最优权重
+            self.coop_gate_triple = nn.Parameter(torch.zeros(3))  # [consistency, temporal, mask]
+        
         # 【v18新增】门控v2策略：特征调制门控
         if self.coop_strategy == 'gating_v2':
             self.coop_gate = nn.Parameter(torch.zeros(1))  # 无偏初始化
@@ -1271,6 +1289,50 @@ class PromptGenerator(nn.Module):
         # 【v15协同】独立的时序注入层配置
         # 如果未设置，则默认与META_PROMPT_INJECT_LAYERS相同
         self.temporal_inject_layers = config.get('TEMPORAL_PROMPT_INJECT_LAYERS', self.inject_layers)
+        
+        # 【v21新增】独立的Mask注入层配置
+        # 如果未设置，则默认与META_PROMPT_INJECT_LAYERS相同
+        self.mask_inject_layers = config.get('MASK_PROMPT_INJECT_LAYERS', self.inject_layers)
+        
+        # 【v22新增】并行独立注入的全局强度系数
+        # 每个提示独立的门控，初始化为单提示的性能比例
+        if self.enable_consistency:
+            self.alpha_consistency = nn.Parameter(torch.tensor(0.1))
+        if self.enable_temporal:
+            self.alpha_temporal = nn.Parameter(torch.tensor(0.1))
+        if self.enable_mask:
+            self.alpha_mask = nn.Parameter(torch.tensor(0.05))
+        
+        # 【v22核心】CVPR 2025层门控（Layer-wise Gating）
+        # 每层学习独立的门控，控制每个提示在该层的注入强度
+        # 门控由该层的原始特征动态生成，完全自适应
+        self.layer_gates = nn.ModuleDict()
+        all_inject_layers = set(self.inject_layers) | set(self.temporal_inject_layers) | set(self.mask_inject_layers)
+        for layer_id in all_inject_layers:
+            # 轻量MLP，生成该层的门控
+            # 输入：rgb_feat和tir_feat的mean拼接
+            # 输出：3维向量，对应Consistency, Temporal, Mask的门控
+            self.layer_gates[str(layer_id)] = nn.Sequential(
+                nn.Linear(self.embed_dim * 2, self.embed_dim // 4),
+                nn.GELU(),
+                nn.Linear(self.embed_dim // 4, 3)
+            )
+            # 【v22修复】分层设置温和初始偏置，避免梯度饱和
+            # 关键：偏置值不能太极端，softmax后不能接近0或1
+            # 否则梯度会饱和，门控无法通过训练微调
+            with torch.no_grad():
+                if layer_id in [5, 6]:
+                    # 低层：Consistency略主导，softmax后 [0.40, 0.35, 0.25]
+                    # 温和偏置，梯度完全正常
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.5, 0.3, 0.0])
+                elif layer_id in [7, 8]:
+                    # 中高层：Temporal略主导，softmax后 [0.30, 0.40, 0.30]
+                    # 温和偏置，避免之前的[0.2, 1.5, -1.2]导致梯度饱和
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.3, 0.5, 0.3])
+                elif layer_id == 9:
+                    # 最高层：均衡注入，softmax后 [0.30, 0.35, 0.35]
+                    # Mask和Temporal略高，Consistency略低
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.25, 0.4, 0.4])
 
     @property
     def total_prompt_len(self):
@@ -1337,10 +1399,17 @@ class PromptGenerator(nn.Module):
                     intermediates['consistency_intermediates'] = consistency_intermediates
 
         if self.enable_mask and self.mask_generator is not None:
-            mask_prompt, mask_intermediates = self.mask_generator(rgb_feat, tir_feat, template_feat=None)
-            if mask_prompt is not None:
-                if mask_intermediates is not None:
-                    intermediates['mask_intermediates'] = mask_intermediates
+            # 【v21新增】检查当前层是否在Mask注入层列表中
+            current_layer_id = getattr(self, '_current_inject_layer', 0)
+            should_inject_mask = current_layer_id in self.mask_inject_layers
+            
+            if should_inject_mask:
+                mask_prompt, mask_intermediates = self.mask_generator(rgb_feat, tir_feat, template_feat=None)
+                if mask_prompt is not None:
+                    if mask_intermediates is not None:
+                        intermediates['mask_intermediates'] = mask_intermediates
+            else:
+                mask_prompt = None
 
         # ===== v5核心：时序模块复用token_consistency =====
         temporal_prompt = None
@@ -1579,8 +1648,22 @@ class PromptGenerator(nn.Module):
                     intermediates['coop_gate_std'] = gate.std(dim=1).mean().item()
         
         # ===== 三提示协同（Mask + Consistency + Temporal）=====
-        # 当三个提示都启用时，Mask会被时序强度动态调整
-        if has_mask and has_temporal:
+        # 【v21新增】三提示门控融合
+        if has_consistency and has_temporal and has_mask:
+            if self.coop_strategy == 'gating_triple' and hasattr(self, 'coop_gate_triple'):
+                # 三提示全局门控融合
+                gate = F.softmax(self.coop_gate_triple, dim=-1)  # [3]
+                
+                # 门控加权融合
+                consistency_prompt = consistency_prompt * gate[0]
+                temporal_prompt = temporal_prompt * gate[1]
+                mask_prompt = mask_prompt * gate[2]
+                
+                # 记录调试信息
+                intermediates['coop_gate_triple'] = gate.detach().cpu().tolist()
+        
+        # 原有的三提示协同逻辑（非门控策略时）
+        elif has_mask and has_temporal:
             temporal_strength = temporal_weight.mean(dim=1, keepdim=True).unsqueeze(-1)
             
             # 【v16修复】保护性Mask调制
@@ -1592,6 +1675,101 @@ class PromptGenerator(nn.Module):
             
             mask_prompt = mask_prompt * mask_modulate
             intermediates['coop_mask_modulate'] = mask_modulate.mean().item()
+
+        # ===== 【v22核心】并行独立注入+分层残差融合 =====
+        # CVPR 2025 CVPT方法：每个提示独立计算、独立注入，完全不互相干扰
+        if self.coop_strategy == 'parallel_residual':
+            current_layer_id = getattr(self, '_current_inject_layer', 0)
+            
+            # 记录每个提示的注入状态
+            inject_info = []
+            
+            # 1. Consistency独立注入
+            if consistency_prompt is not None and current_layer_id in self.inject_layers:
+                # 【v22修复】直接使用alpha值，不用sigmoid（sigmoid(0.1)≈0.525太大）
+                alpha_c = torch.clamp(self.alpha_consistency, min=0.01, max=0.5)
+                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                    consistency_modulation = self.cross_attn_modulation(consistency_prompt, x_search)
+                else:
+                    consistency_modulation = consistency_prompt.mean(dim=1, keepdim=True)
+                x_search = x_search + alpha_c * consistency_modulation
+                inject_info.append(f'consistency@L{current_layer_id}')
+                intermediates['alpha_consistency'] = alpha_c.item()
+            
+            # 2. Temporal独立注入
+            if temporal_prompt is not None and current_layer_id in self.temporal_inject_layers:
+                alpha_t = torch.clamp(self.alpha_temporal, min=0.01, max=0.5)
+                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                    temporal_modulation = self.cross_attn_modulation(temporal_prompt, x_search)
+                else:
+                    temporal_modulation = temporal_prompt.mean(dim=1, keepdim=True)
+                x_search = x_search + alpha_t * temporal_modulation
+                inject_info.append(f'temporal@L{current_layer_id}')
+                intermediates['alpha_temporal'] = alpha_t.item()
+            
+            # 3. Mask独立注入
+            if mask_prompt is not None and current_layer_id in self.mask_inject_layers:
+                alpha_m = torch.clamp(self.alpha_mask, min=0.01, max=0.5)
+                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                    mask_modulation = self.cross_attn_modulation(mask_prompt, x_search)
+                else:
+                    mask_modulation = mask_prompt.mean(dim=1, keepdim=True)
+                x_search = x_search + alpha_m * mask_modulation
+                inject_info.append(f'mask@L{current_layer_id}')
+                intermediates['alpha_mask'] = alpha_m.item()
+            
+            intermediates['parallel_inject_info'] = inject_info
+            return x_search, intermediates
+        
+        # ===== 【v22核心】CVPR 2025层门控（Layer-wise Gating）=====
+        # 完全保留最优注入层，完全自适应强度
+        # 每层学习独立的门控，控制每个提示在该层的注入强度
+        if self.coop_strategy == 'layer_gating':
+            current_layer_id = getattr(self, '_current_inject_layer', 0)
+            
+            # 检查当前层是否有门控
+            if str(current_layer_id) in self.layer_gates:
+                # 由该层原始特征动态生成门控
+                gate_input = torch.cat([rgb_feat.mean(dim=1), tir_feat.mean(dim=1)], dim=-1)
+                gate_logits = self.layer_gates[str(current_layer_id)](gate_input)
+                gate = F.softmax(gate_logits, dim=-1)  # [B, 3]
+                
+                # 记录门控用于可视化
+                intermediates['layer_gate'] = gate.mean(dim=0).detach().cpu().tolist()
+                
+                # 【v22关键修复】先基于原始x_search计算所有modulation，再统一注入
+                # 避免顺序注入导致特征污染（Temporal看到被Consistency改烂的特征）
+                modulations = []
+                
+                # 1. Consistency调制（基于原始x_search）
+                if consistency_prompt is not None and current_layer_id in self.inject_layers:
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        consistency_mod = self.cross_attn_modulation(consistency_prompt, x_search)
+                    else:
+                        consistency_mod = consistency_prompt.mean(dim=1, keepdim=True)
+                    modulations.append(('consistency', 0, consistency_mod))
+                
+                # 2. Temporal调制（基于原始x_search，不是被修改后的！）
+                if temporal_prompt is not None and current_layer_id in self.temporal_inject_layers:
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        temporal_mod = self.cross_attn_modulation(temporal_prompt, x_search)
+                    else:
+                        temporal_mod = temporal_prompt.mean(dim=1, keepdim=True)
+                    modulations.append(('temporal', 1, temporal_mod))
+                
+                # 3. Mask调制（基于原始x_search）
+                if mask_prompt is not None and current_layer_id in self.mask_inject_layers:
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        mask_mod = self.cross_attn_modulation(mask_prompt, x_search)
+                    else:
+                        mask_mod = mask_prompt.mean(dim=1, keepdim=True)
+                    modulations.append(('mask', 2, mask_mod))
+                
+                # 统一注入所有modulation（避免特征污染）
+                for name, idx, modulation in modulations:
+                    x_search = x_search + gate[:, idx:idx+1].unsqueeze(-1) * modulation
+            
+            return x_search, intermediates
 
         # 构建prompt_list
         if mask_prompt is not None:
@@ -1609,6 +1787,14 @@ class PromptGenerator(nn.Module):
 
         if len(prompt_list) == 1:
             fused_prompt = prompt_list[0]
+        elif self.coop_strategy == 'gating_triple' and len(prompt_list) == 3:
+            # 【v21修复】三提示门控融合：只有三个prompt都存在时才使用
+            # 检查hasattr确保参数已初始化
+            if not hasattr(self, 'coop_gate_triple'):
+                raise RuntimeError(f"[inject] gating_triple策略需要coop_gate_triple参数，但未初始化！")
+            gate = F.softmax(self.coop_gate_triple, dim=-1)  # [3]
+            intermediates['coop_gate_triple'] = gate.detach().cpu().tolist()
+            fused_prompt = consistency_prompt * gate[0] + temporal_prompt * gate[1] + mask_prompt * gate[2]
         else:
             fused_prompt = self.gated_fusion(prompt_list)
 

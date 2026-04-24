@@ -98,7 +98,9 @@ class VisionTransformerCE(VisionTransformer):
                  act_layer=None, weight_init='', ce_loc=None, ce_keep_ratio=None, search_size=None, template_size=None,
                  new_patch_size=None, prompt_type=None, meta_prompt=False, consistency_version='fusion',
                  base_prompt_inject_layers=None, meta_prompt_inject_layers=None,
-                 meta_enable_mask=True, meta_enable_temporal=True, meta_enable_consistency=True):
+                 meta_enable_mask=True, meta_enable_temporal=True, meta_enable_consistency=True,
+                 coop_strategy='temporal_modulate', temporal_prompt_inject_layers=None,
+                 mask_prompt_inject_layers=None):
         super().__init__()
 
         if isinstance(img_size, tuple):
@@ -206,6 +208,10 @@ class VisionTransformerCE(VisionTransformer):
                     'ENABLE_CONSISTENCY': meta_enable_consistency,
                     'ENABLE_TEMPORAL': meta_enable_temporal,
                     'CONSISTENCY_VERSION': consistency_version,
+                    'COOP_STRATEGY': coop_strategy,
+                    'META_PROMPT_INJECT_LAYERS': meta_prompt_inject_layers if meta_prompt_inject_layers else [],
+                    'TEMPORAL_PROMPT_INJECT_LAYERS': temporal_prompt_inject_layers if temporal_prompt_inject_layers else meta_prompt_inject_layers if meta_prompt_inject_layers else [],
+                    'MASK_PROMPT_INJECT_LAYERS': mask_prompt_inject_layers if mask_prompt_inject_layers else meta_prompt_inject_layers if meta_prompt_inject_layers else [],
                 }
             )
             self.prev_features = None

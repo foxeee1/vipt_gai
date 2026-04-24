@@ -135,7 +135,10 @@ def build_viptrack(cfg, training=True):
                 meta_prompt_inject_layers=meta_prompt_inject_layers,
                 meta_enable_mask=cfg.MODEL.BACKBONE.get('META_ENABLE_MASK', True),
                 meta_enable_temporal=cfg.MODEL.BACKBONE.get('META_ENABLE_TEMPORAL', True),
-                meta_enable_consistency=cfg.MODEL.BACKBONE.get('META_ENABLE_CONSISTENCY', True))
+                meta_enable_consistency=cfg.MODEL.BACKBONE.get('META_ENABLE_CONSISTENCY', True),
+                coop_strategy=cfg.MODEL.BACKBONE.get('COOP_STRATEGY', 'temporal_modulate'),
+                temporal_prompt_inject_layers=cfg.MODEL.BACKBONE.get('TEMPORAL_PROMPT_INJECT_LAYERS', None),
+                mask_prompt_inject_layers=cfg.MODEL.BACKBONE.get('MASK_PROMPT_INJECT_LAYERS', None))
         else:
             backbone = vit_base_patch16_224_ce_prompt(
                 pretrained, drop_path_rate=cfg.TRAIN.DROP_PATH_RATE,

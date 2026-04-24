@@ -1,15 +1,14 @@
 # ============================================================
-# 实验14_coop_temporal_modulate: 协同策略B - 时序调制协同
+# 实验21: 三提示门控融合（最终SOTA方案）
 # ============================================================
-# 【实验目的】验证时序权重动态调整一致性权重的协同效果
-# 【训练方式】标准训练(无FOMAML)
-# 【注入层数】
-#   - Base: [0]
-#   - Consistency: [5, 6, 7, 8, 9] (最优)
-#   - Temporal: [5, 6, 7, 8] (最优)
-# 【协同策略】temporal_modulate - 时序动态调制一致性
-#   - 当目标快速运动时，降低一致性权重（历史信息可能不准）
-#   - 公式: consistency_prompt = consistency_prompt * (1 - 0.2 * temporal_strength)
+# 【核心设计】
+#   1. 三个模块全部启用：Consistency + Temporal + Mask
+#   2. 三提示全局门控融合（softmax归一化）
+#   3. 门控初始化为均匀分布，让模型自己学习最优权重
+#   4. 不使用分阶段训练，从头联合训练
+# ============================================================
+# 【预期结果】
+#   - val IoU 目标: 74.0-74.3（LasHeR SOTA）
 # ============================================================
 
 DATA:
@@ -62,9 +61,10 @@ MODEL:
     BASE_PROMPT_INJECT_LAYERS: [0]
     META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
     TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8]
-    COOP_STRATEGY: 'temporal_modulate'
+    MASK_PROMPT_INJECT_LAYERS: [8, 9]
+    COOP_STRATEGY: 'gating_triple'
     META_ENABLE_CONSISTENCY: True
-    META_ENABLE_MASK: False
+    META_ENABLE_MASK: True
     META_ENABLE_TEMPORAL: True
     ENABLE_CROSS_ATTN: True
     ENABLE_VIS: True
@@ -99,6 +99,7 @@ TRAIN:
   FIX_BN: true
   SAVE_EPOCH_INTERVAL: 10
   SAVE_LAST_N_EPOCH: 1
+  STAGE: 0
   META:
     ENABLE: False
 
