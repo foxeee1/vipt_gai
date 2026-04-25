@@ -41,8 +41,12 @@ from lib.models.vipt.utils import combine_tokens, recover_tokens
 
 def parse_args():
     p = argparse.ArgumentParser(description='ViPT逐层可视化(对齐跟踪pipeline)')
-    p.add_argument('--checkpoint', required=True)
-    p.add_argument('--config', required=True)
+    p.add_argument('--checkpoint', default=None,
+                   help='单个checkpoint路径 (与--batch互斥)')
+    p.add_argument('--config', default=None,
+                   help='单个config路径 (与--batch互斥)')
+    p.add_argument('--batch', action='store_true',
+                   help='批量模式: 自动扫描output/checkpoints下所有实验')
     p.add_argument('--video_idx', type=int, default=0)
     p.add_argument('--output_dir', default='viz_quick')
     p.add_argument('--num_frames', type=int, default=3)
@@ -50,7 +54,34 @@ def parse_args():
                    help='要可视化的层, 如 "all" "0,5,11" "0-3,11"')
     p.add_argument('--show_prompt', action='store_true',
                    help='显示Prompt注入前后的对比')
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.batch and (args.checkpoint is None or args.config is None):
+        p.error('需要指定 --batch 或 --checkpoint + --config')
+    return args
+
+
+def find_all_experiments():
+    """扫描output/checkpoints下所有有checkpoint的实验，返回[(config_path, ckpt_path), ...]"""
+    ckpt_base = os.path.join(_project_root, 'output', 'checkpoints', 'train', 'vipt')
+    cfg_base = os.path.join(_project_root, 'experiments', 'vipt')
+    results = []
+    if not os.path.isdir(ckpt_base):
+        print(f"[批量] checkpoint目录不存在: {ckpt_base}")
+        return results
+    for exp_name in sorted(os.listdir(ckpt_base)):
+        exp_dir = os.path.join(ckpt_base, exp_name)
+        if not os.path.isdir(exp_dir):
+            continue
+        ckpts = sorted([f for f in os.listdir(exp_dir) if f.endswith('.pth.tar')])
+        if not ckpts:
+            continue
+        ckpt_path = os.path.join(exp_dir, ckpts[-1])
+        cfg_path = os.path.join(cfg_base, exp_name + '.yaml')
+        if not os.path.exists(cfg_path):
+            print(f"[批量] ⚠ 跳过 {exp_name}: 找不到config {cfg_path}")
+            continue
+        results.append((cfg_path, ckpt_path, exp_name))
+    return results
 
 
 def parse_layers(layers_str, max_layers=12):
@@ -313,9 +344,16 @@ def draw_heatmap_overlay(srch_rgb, heatmap, gt_box_in_search=None, score_max_pos
     return blended
 
 
-def main():
-    args = parse_args()
-    cfg = edict(yaml.safe_load(open(args.config)))
+def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
+    """运行单个实验的可视化"""
+    cfg = edict(yaml.safe_load(open(cfg_path)))
+
+    if 'TEST' not in cfg:
+        cfg.TEST = edict()
+    cfg.TEST.TEMPLATE_FACTOR = getattr(cfg.TEST, 'TEMPLATE_FACTOR', 2.0)
+    cfg.TEST.TEMPLATE_SIZE = getattr(cfg.TEST, 'TEMPLATE_SIZE', 128)
+    cfg.TEST.SEARCH_FACTOR = getattr(cfg.TEST, 'SEARCH_FACTOR', 4.0)
+    cfg.TEST.SEARCH_SIZE = getattr(cfg.TEST, 'SEARCH_SIZE', 256)
 
     template_factor = cfg.TEST.TEMPLATE_FACTOR
     template_size = cfg.TEST.TEMPLATE_SIZE
@@ -323,7 +361,7 @@ def main():
     search_size = cfg.TEST.SEARCH_SIZE
 
     model = build_viptrack(cfg, training=False)
-    ckpt = torch.load(args.checkpoint, map_location='cpu')
+    ckpt = torch.load(ckpt_path, map_location='cpu')
     model.load_state_dict(ckpt.get('model', ckpt.get('net', ckpt)), strict=False)
     model = model.cuda().eval()
 
@@ -351,7 +389,7 @@ def main():
     if not frames:
         return
 
-    out_dir = os.path.join(args.output_dir, os.path.basename(args.config).replace('.yaml', ''))
+    out_dir = os.path.join(args.output_dir, exp_name)
     os.makedirs(out_dir, exist_ok=True)
 
     init_bbox = gt_list[0]
@@ -483,7 +521,7 @@ def main():
             col_labels.append('|Prompt-RGB| Diff')
         sm_max_str = f'{sm_final.max():.3f}' if sm_final is not None else 'N/A'
         plt.suptitle(
-            f'Frame {frame_i} | {os.path.basename(args.config)}\n'
+            f'Frame {frame_i} | {exp_name}\n'
             f'Layers: {layers} | Score_max={sm_max_str}',
             fontsize=13, fontweight='bold')
         plt.tight_layout()
@@ -644,7 +682,7 @@ def main():
             ax.set_title(f'F{frame_i} {title}' if frame_i == 0 else title, fontsize=10)
             ax.axis('off')
 
-    plt.suptitle(f'{os.path.basename(args.config)} | Video {args.video_idx} | Overview',
+    plt.suptitle(f'{exp_name} | Video {args.video_idx} | Overview',
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
     overview_path = os.path.join(out_dir, f'overview_v{args.video_idx}.png')
@@ -664,6 +702,39 @@ def main():
     print(f"  Attention Map     - Search区域自注意力热力图")
     if args.show_prompt:
         print(f"  Prompt Diff       - |有Prompt - 无Prompt| 差异热力图")
+
+
+def main():
+    args = parse_args()
+
+    if args.batch:
+        experiments = find_all_experiments()
+        if not experiments:
+            print("[批量] 未找到任何实验!")
+            return
+        print(f"[批量] 共找到 {len(experiments)} 个实验:")
+        for i, (cfg_path, ckpt_path, exp_name) in enumerate(experiments):
+            print(f"  [{i+1}] {exp_name}")
+            print(f"       config: {cfg_path}")
+            print(f"       ckpt:   {ckpt_path}")
+        print()
+        for i, (cfg_path, ckpt_path, exp_name) in enumerate(experiments):
+            print(f"\n{'='*60}")
+            print(f"[批量] ({i+1}/{len(experiments)}) 运行: {exp_name}")
+            print(f"{'='*60}")
+            try:
+                run_single_experiment(args, cfg_path, ckpt_path, exp_name)
+            except Exception as e:
+                print(f"[批量] ❌ {exp_name} 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        print(f"\n{'='*60}")
+        print(f"[批量] 全部完成! 共 {len(experiments)} 个实验")
+        print(f"{'='*60}")
+    else:
+        exp_name = os.path.basename(os.path.dirname(args.checkpoint))
+        run_single_experiment(args, args.config, args.checkpoint, exp_name)
 
 
 if __name__ == '__main__':
