@@ -234,7 +234,8 @@ class MaskPromptGenerator(nn.Module):
         """初始化所有线性层和偏置"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                # 【v22修复】gain从0.1提升到1.0，与Temporal同步
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
@@ -493,7 +494,8 @@ class ConsistencyPromptGenerator(nn.Module):
         """初始化所有线性层和偏置"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                # 【v22修复】gain从0.1提升到1.0，与Temporal同步
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
@@ -774,12 +776,25 @@ class TemporalPromptGenerator(nn.Module):
             nn.Linear(128, 1)
         )
 
+        # ===== v24新增：自学习模态对齐MLP（解耦Consistency依赖） =====
+        # 问题：Temporal依赖Consistency的token_consistency（稳定在0.5）
+        #       导致aligned_feat=0.5*rgb+0.5*tir完全固定，帧差无意义
+        # 解决：Temporal自己计算模态对齐权重，不依赖上游
+        self.align_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 1),
+            nn.Sigmoid()
+        )
+
         # ===== v9核心3: 时序Prompt投影层 =====
         self.temporal_proj = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.GELU()
         )
+        # 【v22修复】输出LayerNorm，稳定特征分布
+        self.temporal_output_norm = nn.LayerNorm(embed_dim)
 
         # ===== v9核心4: 基础位置编码 =====
         self.pos_encoding = nn.Parameter(torch.randn(1, num_prompt_tokens, embed_dim) * 0.01)
@@ -801,6 +816,7 @@ class TemporalPromptGenerator(nn.Module):
         # ===== v9核心8: 动态缓存 =====
         self._prev_aligned_feat_cache = None
         self._prev_layer_weights = {}
+        self._prev_frame_weights = {}  # 【v25新增】帧间平滑缓存
         self._current_layer_id = 0
         self._training_step = 0  # 用于正则化退火
 
@@ -813,7 +829,9 @@ class TemporalPromptGenerator(nn.Module):
         """初始化所有线性层"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                # 【v22修复】gain从0.1提升到1.0
+                # 原gain=0.1导致权重仅0.01量级，temporal输出≈0，梯度99%丢失
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LayerNorm):
@@ -821,9 +839,9 @@ class TemporalPromptGenerator(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def reset_cache(self):
-        """重置时序缓存（每个视频首帧调用）"""
         self._prev_aligned_feat_cache = None
         self._prev_layer_weights.clear()
+        self._prev_frame_weights.clear()  # 【v25新增】清除帧间缓存
 
     def forward(self, rgb_feat: torch.Tensor, tir_feat: torch.Tensor,
                 prev_state: Optional[torch.Tensor] = None,
@@ -853,25 +871,31 @@ class TemporalPromptGenerator(nn.Module):
         layer_idx = min(layer_id, self.max_layers - 1)  # 安全限制
         self._current_layer_id = layer_id
 
-        # ===== v9 Step1: 计算对齐特征 =====
-        if token_consistency is None:
-            token_consistency = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
+        # ===== v9 Step1: 计算对齐特征（v24解耦上游依赖） =====
+        # 【v24关键修复】不再依赖Consistency的token_consistency（稳定在0.5导致帧差无意义）
+        # 改用自学习align_mlp计算模态对齐权重，保证时序建模的有效性
         
-        if torch.isnan(token_consistency).any():
-            token_consistency = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
+        combined_feat = torch.cat([rgb_feat, tir_feat], dim=-1)
+        self_align_weight = self.align_mlp(combined_feat).squeeze(-1)
+        self_align_weight = torch.clamp(self_align_weight, min=0.3, max=0.7)
         
-        # 【v21修复】处理token_consistency的维度
-        # ConsistencyPromptGenerator返回[B, N, 1]，需要squeeze到[B, N]
-        if token_consistency.dim() == 3:
-            token_consistency = token_consistency.squeeze(-1)
+        if torch.isnan(self_align_weight).any():
+            self_align_weight = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
         
-        token_consistency = torch.clamp(token_consistency, min=0.01, max=0.99)
-        
-        aligned_feat = token_consistency.unsqueeze(-1) * rgb_feat + (1 - token_consistency).unsqueeze(-1) * tir_feat
+        aligned_feat = self_align_weight.unsqueeze(-1) * rgb_feat + (1 - self_align_weight).unsqueeze(-1) * tir_feat
 
         # ===== v9 Step2: 计算帧差 =====
         if self._prev_aligned_feat_cache is not None and self._prev_aligned_feat_cache.shape == (B, N, C):
-            frame_diff = aligned_feat - self._prev_aligned_feat_cache
+            # 【v23修复】缓存NaN保护：如果缓存有异常，重置为当前帧
+            if torch.isnan(self._prev_aligned_feat_cache).any() or torch.isinf(self._prev_aligned_feat_cache).any():
+                self._prev_aligned_feat_cache = None
+            
+            if self._prev_aligned_feat_cache is not None:
+                frame_diff = aligned_feat - self._prev_aligned_feat_cache
+                # 【v23修复】帧差幅值限制：防止极端值导致编码器输出爆炸
+                frame_diff = torch.clamp(frame_diff, min=-5.0, max=5.0)
+            else:
+                frame_diff = torch.zeros(B, N, C, device=rgb_feat.device, dtype=rgb_feat.dtype)
         else:
             frame_diff = torch.zeros(B, N, C, device=rgb_feat.device, dtype=rgb_feat.dtype)
 
@@ -914,7 +938,9 @@ class TemporalPromptGenerator(nn.Module):
 
         # ===== v10 Step5: 运动门控（层自适应阈值）=====
         layer_gate_threshold = 0.3 + self.layer_gate_threshold[layer_idx]
-        motion_gate = 0.3 + 0.7 * torch.sigmoid(2.0 * (global_motion.squeeze(-1) - layer_gate_threshold))
+        # 【v22修复】确保motion_gate最小值0.5，避免梯度被过度衰减
+        # 原版0.3+0.7*sigmoid最小0.3，太小导致65%梯度丢失
+        motion_gate = 0.5 + 0.5 * torch.sigmoid(2.0 * (global_motion.squeeze(-1) - layer_gate_threshold))
 
         # ===== v10 Step6: 生成时序Prompt（层自适应位置编码）=====
         if fused_feat is None:
@@ -929,6 +955,8 @@ class TemporalPromptGenerator(nn.Module):
         layer_pos_bias = self.layer_pos_bias[layer_idx].unsqueeze(0)  # [1, 1, C]
         temporal_prompt = temporal_prompt + self.pos_encoding + layer_pos_bias
 
+        # 【v22修复】用LayerNorm稳定输出分布，再乘motion_gate
+        temporal_prompt = self.temporal_output_norm(temporal_prompt)
         temporal_prompt = motion_gate.unsqueeze(-1) * temporal_prompt
 
         if torch.isnan(temporal_prompt).any():
@@ -936,14 +964,20 @@ class TemporalPromptGenerator(nn.Module):
         if torch.isinf(temporal_prompt).any():
             temporal_prompt = torch.clamp(temporal_prompt, min=-10.0, max=10.0)
 
-        # ===== v10 Step7: 记录当前层权重（用于层间差异约束）=====
+        # ===== v10 Step7: 记录当前层权重（用于层间差异+帧间平滑约束）=====
         self._prev_layer_weights[layer_id] = temporal_weight.detach().clone()
 
-        layer_divergence = 0.0
+        # 【v25修复】层间差异改为tensor（原.item()导致无法反向传播）
+        layer_divergence_tensor = torch.tensor(0.0, device=temporal_weight.device)
         if layer_id > 0 and (layer_id - 1) in self._prev_layer_weights:
             prev_layer_weight = self._prev_layer_weights[layer_id - 1]
             if prev_layer_weight.shape == temporal_weight.shape:
-                layer_divergence = torch.mean((temporal_weight - prev_layer_weight) ** 2).item()
+                layer_divergence_tensor = torch.mean((temporal_weight - prev_layer_weight) ** 2)
+
+        # 【v25新增】获取上一帧同层权重（用于帧间平滑约束）
+        prev_temporal_w = self._prev_frame_weights.get(layer_id, None)
+        # 更新当前帧权重缓存
+        self._prev_frame_weights[layer_id] = temporal_weight.detach().clone()
 
         # ===== 可视化记录 =====
         vis = PromptVisualizer.get()
@@ -955,7 +989,7 @@ class TemporalPromptGenerator(nn.Module):
             vis.log_scalar('Temporal/temporal_weight_mean', temporal_weight.mean().item())
             vis.log_scalar('Temporal/weight_deviation', (temporal_weight - 0.5).abs().mean().item())
             vis.log_scalar(f'Temporal/layer{layer_id}_weight_mean', temporal_weight.mean().item())
-            vis.log_scalar(f'Temporal/layer{layer_id}_divergence', layer_divergence)
+            vis.log_scalar(f'Temporal/layer{layer_id}_divergence', layer_divergence_tensor.item())
             vis.log_scalar('Temporal/noise_std', noise_std if self.training else 0.0)
 
         if return_intermediate:
@@ -964,7 +998,8 @@ class TemporalPromptGenerator(nn.Module):
                 'global_motion': global_motion,
                 'motion_gate': motion_gate,
                 'layer_id': layer_id,
-                'layer_divergence': layer_divergence,
+                'layer_divergence': layer_divergence_tensor,
+                'prev_temporal_weight': prev_temporal_w,
                 '_debug_valid': True,
             }
             return temporal_prompt, temporal_weight, intermediates
@@ -1076,7 +1111,10 @@ class CrossAttentionModulation(nn.Module):
         # 轻量输出投影
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        # 可学习调制强度（增大初始值和上限，确保梯度能传播）
+        # 【v22修复】输出LayerNorm，稳定调制信号分布
+        self.mod_norm = nn.LayerNorm(embed_dim)
+
+        # 可学习调制强度
         self.alpha = nn.Parameter(torch.tensor(0.5))
 
         self._init_weights()
@@ -1131,8 +1169,12 @@ class CrossAttentionModulation(nn.Module):
         # ===== 关键：Mean Pooling得到全局信号 [B, 1, C] =====
         global_signal = attn_out.mean(dim=1, keepdim=True)
 
-        # 可学习调制强度（增大上限到0.3，确保Prompt有足够影响）
-        alpha = torch.sigmoid(self.alpha) * 0.3
+        # 【v22修复】LayerNorm稳定调制信号分布
+        global_signal = self.mod_norm(global_signal)
+
+        # 【v22修复】可学习调制强度，上限从0.3提升到1.0
+        # 原版alpha*0.3上限太小，70%梯度被截断
+        alpha = torch.sigmoid(self.alpha) * 1.0
 
         # 加法调制（广播到所有L个token）
         modulated_x = x + alpha * global_signal
@@ -1317,22 +1359,22 @@ class PromptGenerator(nn.Module):
                 nn.GELU(),
                 nn.Linear(self.embed_dim // 4, 3)
             )
-            # 【v22修复】分层设置温和初始偏置，避免梯度饱和
-            # 关键：偏置值不能太极端，softmax后不能接近0或1
-            # 否则梯度会饱和，门控无法通过训练微调
+            # 【v25修复】层解耦后的门控初始化（提升Temporal偏置）
+            # 问题：v24的偏置太温和，Temporal在7/8层gate不够高，prompt_mean衰减
+            # 解决：给Temporal更高初始偏置，保证注入强度
             with torch.no_grad():
                 if layer_id in [5, 6]:
-                    # 低层：Consistency略主导，softmax后 [0.40, 0.35, 0.25]
-                    # 温和偏置，梯度完全正常
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.5, 0.3, 0.0])
-                elif layer_id in [7, 8]:
-                    # 中高层：Temporal略主导，softmax后 [0.30, 0.40, 0.30]
-                    # 温和偏置，避免之前的[0.2, 1.5, -1.2]导致梯度饱和
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.3, 0.5, 0.3])
+                    # 低层：Consistency完全独占
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([2.0, -2.0, -2.0])
+                elif layer_id == 7:
+                    # 过渡层：Temporal略主导（从0.5→0.8）
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.2, 0.8, -2.0])
+                elif layer_id == 8:
+                    # 中高层：Temporal完全独占（强化偏置）
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-2.0, 2.0, -2.0])
                 elif layer_id == 9:
-                    # 最高层：均衡注入，softmax后 [0.30, 0.35, 0.35]
-                    # Mask和Temporal略高，Consistency略低
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.25, 0.4, 0.4])
+                    # 最高层：Temporal为主，Mask为辅
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-2.0, 0.6, 0.4])
 
     @property
     def total_prompt_len(self):
@@ -1385,41 +1427,38 @@ class PromptGenerator(nn.Module):
             print(f"[DEBUG inject] enable_consistency={self.enable_consistency}, enable_mask={self.enable_mask}, enable_temporal={self.enable_temporal}")
             self._inject_debug_printed = True
 
-        # ===== v5核心：先计算Consistency，获取token_consistency =====
+        # ===== v5核心：先判断当前层需要注入哪些模块（v24层解耦） =====
+        current_layer_id = getattr(self, '_current_inject_layer', 0)
+        
+        # 【v24关键修复】每层只计算需要注入的模块，非注入层完全不forward
+        # 彻底消除无效梯度干扰：之前非注入层的Temporal也在forward，导致全局锁死
+        inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
+        inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
+        inject_mask = self.enable_mask and current_layer_id in self.mask_inject_layers
+        
         token_consistency = None
         consistency_prompt = None
         mask_prompt = None
 
-        if self.enable_consistency and self.consistency_generator is not None:
+        # 只在注入层才计算Consistency
+        if inject_consistency and self.consistency_generator is not None:
             consistency_prompt, consistency_intermediates = self.consistency_generator(rgb_feat, tir_feat, template_feat=None)
             if consistency_prompt is not None:
-                # 从intermediates获取token_consistency（用于时序模块）
                 if consistency_intermediates is not None:
                     token_consistency = consistency_intermediates.get('token_consistency', None)
                     intermediates['consistency_intermediates'] = consistency_intermediates
 
-        if self.enable_mask and self.mask_generator is not None:
-            # 【v21新增】检查当前层是否在Mask注入层列表中
-            current_layer_id = getattr(self, '_current_inject_layer', 0)
-            should_inject_mask = current_layer_id in self.mask_inject_layers
-            
-            if should_inject_mask:
-                mask_prompt, mask_intermediates = self.mask_generator(rgb_feat, tir_feat, template_feat=None)
-                if mask_prompt is not None:
-                    if mask_intermediates is not None:
-                        intermediates['mask_intermediates'] = mask_intermediates
-            else:
-                mask_prompt = None
+        # 只在注入层才计算Mask
+        if inject_mask and self.mask_generator is not None:
+            mask_prompt, mask_intermediates = self.mask_generator(rgb_feat, tir_feat, template_feat=None)
+            if mask_prompt is not None:
+                if mask_intermediates is not None:
+                    intermediates['mask_intermediates'] = mask_intermediates
 
-        # ===== v5核心：时序模块复用token_consistency =====
+        # 只在注入层才计算Temporal
         temporal_prompt = None
         temporal_weight = None
-        if self.enable_temporal and self.temporal_generator is not None:
-            # 【v15协同】检查当前层是否在时序注入层列表中
-            current_layer_id = getattr(self, '_current_inject_layer', 0)
-            should_inject_temporal = current_layer_id in self.temporal_inject_layers
-            
-            if should_inject_temporal:
+        if inject_temporal and self.temporal_generator is not None:
                 fused_feat = (rgb_feat + tir_feat) / 2.0
 
                 # 调用v10时序模块，传入layer_id实现层自适应
@@ -1765,9 +1804,18 @@ class PromptGenerator(nn.Module):
                         mask_mod = mask_prompt.mean(dim=1, keepdim=True)
                     modulations.append(('mask', 2, mask_mod))
                 
-                # 统一注入所有modulation（避免特征污染）
+                # 【v22修复1】统一注入所有modulation（避免特征污染）
+                # 【v22修复2】确保门控最小值0.1，保证梯度通道畅通
+                total_modulation = torch.zeros_like(x_search)
                 for name, idx, modulation in modulations:
-                    x_search = x_search + gate[:, idx:idx+1].unsqueeze(-1) * modulation
+                    # 【v25修复】门控最小值从0.1提升到0.2，保证注入强度
+                    # 问题：v24的0.1太低，导致prompt_mean从0.03衰减到0.025
+                    effective_gate = 0.2 + 0.8 * gate[:, idx:idx+1].unsqueeze(-1)
+                    total_modulation = total_modulation + effective_gate * modulation
+                
+                # 【v22修复3】残差梯度通道：直接从prompt到x_search
+                # 即使门控很小，也有最小梯度流过，防止模块完全死掉
+                x_search = x_search + total_modulation
             
             return x_search, intermediates
 

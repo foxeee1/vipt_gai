@@ -103,6 +103,19 @@ class ViPTMetaActor(BaseActor):
                 print("[Meta-TB] ⚠ TensorBoard logging disabled (no paths configured)")
             self.tb_writer = None
 
+        # 【v25新增】冻结Consistency模块，让Temporal/Mask专注学习
+        # 曲线证据：Consistency已完全收敛（avg_weight=0.5稳定, prompt_mean=2.0+）
+        #          三个模块竞争导致Temporal权重震荡、Mask完全失效
+        freeze_consistency = getattr(cfg.TRAIN.META, 'FREEZE_CONSISTENCY', True)
+        if freeze_consistency:
+            net = self.net.module if hasattr(self.net, 'module') else self.net
+            frozen_count = 0
+            for name, param in net.named_parameters():
+                if 'consistency_generator' in name:
+                    param.requires_grad = False
+                    frozen_count += 1
+            print(f"[v25] ✓ Frozen {frozen_count} Consistency parameters")
+
     def fix_bns(self):
         net = self.net.module if hasattr(self.net, 'module') else self.net
         net.box_head.apply(lambda m: m.eval() if m.__class__.__name__.find('BatchNorm') != -1 else None)

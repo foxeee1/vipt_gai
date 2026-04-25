@@ -8,3 +8,5 @@ pretrained/
 *.ckpt
 __pycache__/
 tensorboard/
+viz_quick/
+viz_vipt/

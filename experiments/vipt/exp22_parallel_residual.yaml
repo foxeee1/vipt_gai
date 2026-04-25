@@ -1,20 +1,19 @@
 # ============================================================
-# 实验22: CVPR 2025层门控（Layer-wise Gating）
+# 实验22: CVPR 2025层门控（Layer-wise Gating）- v23层解耦版
 # ============================================================
-# 【核心设计】
-#   1. 三个模块全部启用：Consistency + Temporal + Mask
-#   2. 完全保留最优注入层，不做任何妥协
-#   3. 每层学习独立的门控，控制每个提示在该层的注入强度
-#   4. 门控由该层的原始特征动态生成，完全自适应
-#   5. 从根源上避免特征竞争
-# ============================================================
-# 【注入层配置】（完全保留最优层）
-#   - Consistency: [5, 6, 7, 8, 9]
-#   - Temporal: [5, 6, 7, 8, 9]
-#   - Mask: [8, 9]
+# 【v23核心改进 — 层注入解耦】
+#   问题：三提示并行时，低层(5,6)Consistency和Temporal激烈竞争
+#         导致Temporal在5/6层被完全挤掉（weight从0.85暴跌到0.2）
+#   解决：按语义定位分配注入层，最小化重叠
+#
+# 【注入层配置（v23层解耦）】
+#   - Consistency: [5, 6, 7]     → 低层跨模态对齐（独占5,6）
+#   - Temporal:   [7, 8, 9]     → 中高层运动建模（独占8,9）
+#   - Mask:       [9]            → 最高层目标增强（独占9）
+#   重叠：仅第7层（Consistency↔Temporal过渡层）
 # ============================================================
 # 【预期结果】
-#   - val IoU 目标: 74.0-74.2（三个模块性能完美叠加）
+#   - val IoU 目标: 73.5-74.0（消除层间竞争后Temporal恢复）
 # ============================================================
 
 DATA:
@@ -65,9 +64,9 @@ MODEL:
     META_PROMPT: True
     CONSISTENCY_VERSION: 'fusion'
     BASE_PROMPT_INJECT_LAYERS: [0]
-    META_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
-    TEMPORAL_PROMPT_INJECT_LAYERS: [5, 6, 7, 8, 9]
-    MASK_PROMPT_INJECT_LAYERS: [8, 9]
+    META_PROMPT_INJECT_LAYERS: [5, 6, 7]
+    TEMPORAL_PROMPT_INJECT_LAYERS: [7, 8, 9]
+    MASK_PROMPT_INJECT_LAYERS: [9]
     COOP_STRATEGY: 'layer_gating'
     META_ENABLE_CONSISTENCY: True
     META_ENABLE_MASK: True
