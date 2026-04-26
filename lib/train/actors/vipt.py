@@ -164,7 +164,6 @@ class ViPTActor(BaseActor):
         #       tracking_loss小时→正则化权重大（强化约束）
         # 避免正则化和主任务对抗
         tracking_loss_val = tracking_loss.item() + 1e-8
-        dynamic_scale = min(1.0, 2.0 / tracking_loss_val)
 
         current_weight_var = None
         current_weight_entropy = None
@@ -175,7 +174,7 @@ class ViPTActor(BaseActor):
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
 
-            # ===== Consistency正则化 =====
+            # ===== Consistency正则化（双峰分布约束+最小化熵） =====
             if 'consistency_intermediates' in inject_intermediates:
                 consistency_data = inject_intermediates['consistency_intermediates']
                 if consistency_data is not None and isinstance(consistency_data, dict):
@@ -184,7 +183,6 @@ class ViPTActor(BaseActor):
                         token_weight = consistency_data['token_consistency'].squeeze(-1)
                     
                     if token_weight is not None:
-                        # 监控指标
                         weight_var = torch.var(token_weight, dim=1)
                         current_weight_var = weight_var.mean().item()
                         B, N = token_weight.shape
@@ -200,17 +198,16 @@ class ViPTActor(BaseActor):
                             batch_entropies.append(entropy)
                         current_weight_entropy = torch.stack(batch_entropies).mean().item()
 
-                        # 【v22修复】Consistency正则化：去掉base_p条件限制
-                        # 原代码要求base_p is not None才计算，导致consistency_reg恒为0
-                        global_mean = torch.mean(token_weight, dim=1)
-                        mean_reg = torch.mean((global_mean - 0.5) ** 2)
-                        p = token_weight
-                        entropy = - (p * torch.log(p + 1e-8) + (1 - p) * torch.log(1 - p + 1e-8))
-                        target_entropy = 0.5
-                        entropy_reg = torch.mean((entropy - target_entropy) ** 2)
-                        consistency_reg_loss = 0.3 * mean_reg + 0.7 * entropy_reg
-                        # 动态平衡：正则化权重随tracking_loss自适应
-                        loss = loss + 0.05 * dynamic_scale * consistency_reg_loss
+                        # 双峰分布约束：鼓励权重向0/1两端分化
+                        # p*(1-p)在p=0.5时最大，在p=0/1时为0
+                        # 最小化p*(1-p) → 鼓励权重远离0.5
+                        bimodal_reg = torch.mean(token_weight * (1 - token_weight))
+                        # 最小化熵：让权重更有区分度
+                        p = torch.clamp(token_weight, min=1e-6, max=1 - 1e-6)
+                        entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+                        entropy_min_reg = torch.mean(entropy)
+                        consistency_reg_loss = 0.5 * bimodal_reg + 0.5 * entropy_min_reg
+                        loss = loss + 0.02 * consistency_reg_loss
                         current_reg_loss = consistency_reg_loss.item()
 
             # ===== Temporal正则化（v25五维约束） =====
@@ -257,35 +254,24 @@ class ViPTActor(BaseActor):
 
                         # 五维组合：平滑30% + 均值20% + 熵20% + 门控15% + 层间15%
                         temporal_reg_loss = 0.30*smooth_reg + 0.20*mean_reg + 0.20*entropy_reg + 0.15*motion_reg + 0.15*layer_reg
-                        loss = loss + 0.05 * temporal_reg_loss
+                        loss = loss + 0.02 * temporal_reg_loss
                         current_temporal_reg = temporal_reg_loss.item()
 
-            # ===== Mask正则化（v25上下限双向约束） =====
-            # 【v25关键修复】mask_reg恒为0，和之前Temporal的问题完全一致
-            # 原因：mean_reg用单目标0.5，权重锁死在0.5时reg=0
-            # 解决：改为上下限双向约束
+            # ===== Mask正则化（双峰分布约束+最小化熵） =====
             if 'mask_intermediates' in inject_intermediates:
                 mask_data = inject_intermediates['mask_intermediates']
                 if mask_data is not None and isinstance(mask_data, dict):
                     if 'token_reliability' in mask_data:
                         token_reliability = mask_data['token_reliability'].squeeze(-1)
 
-                        # 权重均值上下限：强制在[0.35, 0.65]
-                        mask_mean = token_reliability.mean(dim=1)
-                        mask_lower = torch.mean(torch.relu(0.35 - mask_mean) ** 2)
-                        mask_upper = torch.mean(torch.relu(mask_mean - 0.65) ** 2)
-                        mask_mean_reg = mask_lower + mask_upper
-
-                        # 熵上下限：强制区分度在[0.3, 0.6]
-                        tr = token_reliability
-                        entropy = -(tr * torch.log(tr + 1e-8) + (1 - tr) * torch.log(1 - tr + 1e-8))
-                        ent_lower = torch.mean(torch.relu(0.30 - entropy) ** 2)
-                        ent_upper = torch.mean(torch.relu(entropy - 0.60) ** 2)
-                        mask_entropy_reg = ent_lower + ent_upper
-
-                        # 组合：均值60% + 熵40%
-                        mask_reg_loss = 0.6 * mask_mean_reg + 0.4 * mask_entropy_reg
-                        loss = loss + 0.03 * mask_reg_loss
+                        # 双峰分布约束：鼓励权重向0/1两端分化
+                        bimodal_reg = torch.mean(token_reliability * (1 - token_reliability))
+                        # 最小化熵
+                        tr = torch.clamp(token_reliability, min=1e-6, max=1 - 1e-6)
+                        entropy = -(tr * torch.log(tr) + (1 - tr) * torch.log(1 - tr))
+                        entropy_min_reg = torch.mean(entropy)
+                        mask_reg_loss = 0.5 * bimodal_reg + 0.5 * entropy_min_reg
+                        loss = loss + 0.01 * mask_reg_loss
                         current_mask_reg = mask_reg_loss.item()
 
         if return_status:

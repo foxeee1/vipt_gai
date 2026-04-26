@@ -886,13 +886,11 @@ class TemporalPromptGenerator(nn.Module):
 
         # ===== v9 Step2: 计算帧差 =====
         if self._prev_aligned_feat_cache is not None and self._prev_aligned_feat_cache.shape == (B, N, C):
-            # 【v23修复】缓存NaN保护：如果缓存有异常，重置为当前帧
             if torch.isnan(self._prev_aligned_feat_cache).any() or torch.isinf(self._prev_aligned_feat_cache).any():
                 self._prev_aligned_feat_cache = None
             
             if self._prev_aligned_feat_cache is not None:
                 frame_diff = aligned_feat - self._prev_aligned_feat_cache
-                # 【v23修复】帧差幅值限制：防止极端值导致编码器输出爆炸
                 frame_diff = torch.clamp(frame_diff, min=-5.0, max=5.0)
             else:
                 frame_diff = torch.zeros(B, N, C, device=rgb_feat.device, dtype=rgb_feat.dtype)
@@ -903,8 +901,10 @@ class TemporalPromptGenerator(nn.Module):
         frame_diff_scaled = self.fixed_motion_scale * frame_diff
         frame_diff_normed = self.frame_diff_norm(frame_diff_scaled)
 
-        global_motion = torch.mean(torch.abs(frame_diff_normed), dim=[1, 2], keepdim=True)
+        # 平滑近似abs：sqrt(x^2 + eps)，避免abs在0处梯度消失导致motion_gate无法学习
+        global_motion = torch.mean(torch.sqrt(frame_diff_normed ** 2 + 1e-4), dim=[1, 2], keepdim=True)
 
+        # 跨迭代缓存必须detach，否则backward会试图通过已释放的计算图
         self._prev_aligned_feat_cache = aligned_feat.detach().clone()
 
         # ===== v9 Step4: 帧差编码 → 时序logits（层自适应 + 温度控制）=====
@@ -1324,16 +1324,11 @@ class PromptGenerator(nn.Module):
 
         self.temporal_state = None
 
-        # 【v14】注入层数信息（用于自适应注入强度）
         self.inject_layers = config.get('META_PROMPT_INJECT_LAYERS', [])
         self._current_inject_layer = 0
         
-        # 【v15协同】独立的时序注入层配置
-        # 如果未设置，则默认与META_PROMPT_INJECT_LAYERS相同
         self.temporal_inject_layers = config.get('TEMPORAL_PROMPT_INJECT_LAYERS', self.inject_layers)
         
-        # 【v21新增】独立的Mask注入层配置
-        # 如果未设置，则默认与META_PROMPT_INJECT_LAYERS相同
         self.mask_inject_layers = config.get('MASK_PROMPT_INJECT_LAYERS', self.inject_layers)
         
         # 【v22新增】并行独立注入的全局强度系数
@@ -1351,47 +1346,24 @@ class PromptGenerator(nn.Module):
         self.layer_gates = nn.ModuleDict()
         all_inject_layers = set(self.inject_layers) | set(self.temporal_inject_layers) | set(self.mask_inject_layers)
         for layer_id in all_inject_layers:
-            # 轻量MLP，生成该层的门控
-            # 输入：rgb_feat和tir_feat的mean拼接
-            # 输出：3维向量，对应Consistency, Temporal, Mask的门控
             self.layer_gates[str(layer_id)] = nn.Sequential(
                 nn.Linear(self.embed_dim * 2, self.embed_dim // 4),
                 nn.GELU(),
                 nn.Linear(self.embed_dim // 4, 3)
             )
-            # 【v25修复】层解耦后的门控初始化（提升Temporal偏置）
-            # 问题：v24的偏置太温和，Temporal在7/8层gate不够高，prompt_mean衰减
-            # 解决：给Temporal更高初始偏置，保证注入强度
             with torch.no_grad():
-                if layer_id in [5, 6]:
-                    # 低层：Consistency完全独占
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([2.0, -2.0, -2.0])
-                elif layer_id == 7:
-                    # 过渡层：Temporal略主导（从0.5→0.8）
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.2, 0.8, -2.0])
-                elif layer_id == 8:
-                    # 中高层：Temporal完全独占（强化偏置）
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-2.0, 2.0, -2.0])
-                elif layer_id == 9:
-                    # 最高层：Temporal为主，Mask为辅
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-2.0, 0.6, 0.4])
+                self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0])
 
     @property
     def total_prompt_len(self):
-        """返回总Prompt长度，与原接口兼容"""
         return self.num_prompt_tokens
 
+    def set_current_layer(self, layer_id: int):
+        """每个Transformer block前必须调用，显式设置当前层号"""
+        self._current_inject_layer = layer_id
+
     def reset_temporal_cache(self):
-        """
-        重置时序缓存
-
-        说明：每个视频的首帧调用，清除历史状态
-
-        输入：无
-        输出：无
-        """
         self.temporal_state = None
-        # v5: 重置时序生成器的缓存
         if self.enable_temporal and self.temporal_generator is not None:
             self.temporal_generator.reset_cache()
 
@@ -1773,11 +1745,11 @@ class PromptGenerator(nn.Module):
                 gate_logits = self.layer_gates[str(current_layer_id)](gate_input)
                 gate = F.softmax(gate_logits, dim=-1)  # [B, 3]
                 
-                # 记录门控用于可视化
                 intermediates['layer_gate'] = gate.mean(dim=0).detach().cpu().tolist()
                 
-                # 【v22关键修复】先基于原始x_search计算所有modulation，再统一注入
-                # 避免顺序注入导致特征污染（Temporal看到被Consistency改烂的特征）
+                gate = torch.clamp(gate, min=0.1, max=0.8)
+                gate = gate / gate.sum(dim=-1, keepdim=True)
+                
                 modulations = []
                 
                 # 1. Consistency调制（基于原始x_search）
@@ -1804,17 +1776,11 @@ class PromptGenerator(nn.Module):
                         mask_mod = mask_prompt.mean(dim=1, keepdim=True)
                     modulations.append(('mask', 2, mask_mod))
                 
-                # 【v22修复1】统一注入所有modulation（避免特征污染）
-                # 【v22修复2】确保门控最小值0.1，保证梯度通道畅通
                 total_modulation = torch.zeros_like(x_search)
                 for name, idx, modulation in modulations:
-                    # 【v25修复】门控最小值从0.1提升到0.2，保证注入强度
-                    # 问题：v24的0.1太低，导致prompt_mean从0.03衰减到0.025
-                    effective_gate = 0.2 + 0.8 * gate[:, idx:idx+1].unsqueeze(-1)
+                    effective_gate = gate[:, idx:idx+1].unsqueeze(-1)
                     total_modulation = total_modulation + effective_gate * modulation
                 
-                # 【v22修复3】残差梯度通道：直接从prompt到x_search
-                # 即使门控很小，也有最小梯度流过，防止模块完全死掉
                 x_search = x_search + total_modulation
             
             return x_search, intermediates

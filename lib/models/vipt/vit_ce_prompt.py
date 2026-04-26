@@ -516,6 +516,7 @@ class VisionTransformerCE(VisionTransformer):
         inject_intermediates = {}  # 【关键修改】初始化intermediates，用于收集正则化损失所需的权重
 
         for i, blk in enumerate(self.blocks):
+            self.meta_prompt_generator.set_current_layer(i)
             lens_z_cur = global_index_t.shape[1]
             lens_x_cur = global_index_s.shape[1]
 
@@ -601,10 +602,6 @@ class VisionTransformerCE(VisionTransformer):
                     dim=1, index=global_index_s_safe.unsqueeze(-1).expand(B, -1, C).to(torch.int64))
                 x_rgb_search_cur = x_rgb_search_cur + 0.1 * rgb_dte_diff
                 x_dte_search_cur = x_dte_search_cur - 0.1 * rgb_dte_diff
-                # 【v14】传递当前层数信息给MetaPromptGenerator（用于自适应注入强度）
-                self.meta_prompt_generator._current_inject_layer = i
-                # 调用MetaPromptGenerator生成并立即注入（逐层调制）
-                # 【关键修改】接收intermediates用于计算正则化损失
                 x_rgb_search_modulated, inject_intermediates = self.meta_prompt_generator.inject(
                     x_rgb_search_cur, x_dte_search_cur, x_rgb_search,
                     prev_features=self.prev_features,

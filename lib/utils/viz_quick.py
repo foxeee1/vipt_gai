@@ -54,6 +54,8 @@ def parse_args():
                    help='要可视化的层, 如 "all" "0,5,11" "0-3,11"')
     p.add_argument('--show_prompt', action='store_true',
                    help='显示Prompt注入前后的对比')
+    p.add_argument('--compare', action='store_true',
+                   help='对比模式: 生成所有实验的并排对比图(共享colorbar)')
     args = p.parse_args()
     if not args.batch and (args.checkpoint is None or args.config is None):
         p.error('需要指定 --batch 或 --checkpoint + --config')
@@ -196,18 +198,65 @@ def load_video(video_idx=0, max_frames=10):
     return frames, gt_list
 
 
-def token_to_heatmap(tokens, feat_sz, search_size=256):
-    """将Search Token [B, N, C] 转为热力图 [H, W]"""
+def token_to_heatmap(tokens, feat_sz, search_size=256, vmin=None, vmax=None,
+                      global_index_s=None, gt_bbox_in_search=None):
+    """将Search Token [B, N, C] 转为热力图 [H, W]
+    
+    核心修复: 适配CE剪枝，用global_index_s恢复Token的原始空间位置
+    
+    Args:
+        tokens: Search Token [B, N, C]
+        feat_sz: 特征图尺寸 (默认16)
+        search_size: 搜索图尺寸 (默认256)
+        vmin/vmax: 固定归一化范围
+        global_index_s: 该层Search Token的原始空间索引 [B, N] (CE模块返回)
+        gt_bbox_in_search: 搜索图上的GT框 [x1,y1,w,h]，用于目标引导归一化
+    """
     feat = tokens[0].mean(dim=-1).detach().cpu().numpy()
     h = w = feat_sz
-    if len(feat) < h * w:
-        feat_padded = np.zeros(h * w)
-        feat_padded[:len(feat)] = feat
-        feat = feat_padded
-    feat = feat[:h * w].reshape(h, w)
-    feat_norm = (feat - feat.min()) / (feat.max() - feat.min() + 1e-8)
-    feat_resized = cv2.resize(feat_norm.astype(np.float32), (search_size, search_size))
-    return feat_resized
+    total_tokens = h * w
+    N_tokens = len(feat)
+
+    feat_map = np.zeros(total_tokens, dtype=np.float32)
+
+    if global_index_s is not None:
+        idx = global_index_s[0].cpu().numpy().astype(np.int64)
+        valid_mask = (idx >= 0) & (idx < total_tokens)
+        feat_map[idx[valid_mask]] = feat[valid_mask]
+    else:
+        feat_map[:min(N_tokens, total_tokens)] = feat[:min(N_tokens, total_tokens)]
+
+    feat_map = feat_map.reshape(h, w)
+
+    if gt_bbox_in_search is not None:
+        x1, y1, w_bbox, h_bbox = gt_bbox_in_search
+        x1_f = int(max(0, (x1 / search_size) * feat_sz))
+        y1_f = int(max(0, (y1 / search_size) * feat_sz))
+        x2_f = int(min(feat_sz, ((x1 + w_bbox) / search_size) * feat_sz))
+        y2_f = int(min(feat_sz, ((y1 + h_bbox) / search_size) * feat_sz))
+        if x2_f > x1_f and y2_f > y1_f:
+            target_max = feat_map[y1_f:y2_f, x1_f:x2_f].max()
+            vmax_auto = max(target_max, np.percentile(feat_map, 99.5))
+            vmin_auto = np.percentile(feat_map, 0.5)
+        else:
+            vmin_auto, vmax_auto = np.percentile(feat_map, [0.5, 99.5])
+    else:
+        vmin_auto, vmax_auto = np.percentile(feat_map, [0.5, 99.5])
+
+    if vmax_auto - vmin_auto < 1e-8:
+        vmin_auto, vmax_auto = feat_map.min(), feat_map.max()
+    vmin = vmin_auto if vmin is None else vmin
+    vmax = vmax_auto if vmax is None else vmax
+
+    feat_clip = np.clip(feat_map, vmin, vmax)
+    feat_norm = (feat_clip - vmin) / (vmax - vmin + 1e-8)
+
+    keep_ratio = N_tokens / total_tokens if total_tokens > 0 else 1.0
+    gamma = 0.55 if keep_ratio < 0.7 else 1.0
+    feat_enhanced = np.power(feat_norm, gamma)
+
+    feat_resized = cv2.resize(feat_enhanced.astype(np.float32), (search_size, search_size))
+    return feat_resized, vmin, vmax
 
 
 def attn_to_heatmap(attn, lens_z, feat_sz, search_size=256):
@@ -227,16 +276,21 @@ def attn_to_heatmap(attn, lens_z, feat_sz, search_size=256):
         for idx in range(min(search_attn.shape[0], h * w)):
             diag[idx] = search_attn[idx].mean()
     diag = diag.reshape(h, w)
-    diag_norm = (diag - diag.min()) / (diag.max() - diag.min() + 1e-8)
+    lo, hi = np.percentile(diag, [1, 99])
+    if hi - lo < 1e-8:
+        lo, hi = diag.min(), diag.max()
+    diag_norm = (np.clip(diag, lo, hi) - lo) / (hi - lo + 1e-8)
     return cv2.resize(diag_norm.astype(np.float32), (search_size, search_size))
 
 
 class LayerHook:
-    """Hook提取每层Transformer Block的中间特征和注意力"""
+    """Hook提取每层Transformer Block的输入特征、输出特征、注意力和CE空间索引"""
 
     def __init__(self):
         self.features = {}
+        self.inputs = {}
         self.attns = {}
+        self.global_index_s = {}
         self._handles = []
 
     def register(self, model):
@@ -246,13 +300,28 @@ class LayerHook:
             self._handles.append(h1)
             h2 = blk.attn.register_forward_hook(self._make_attn_hook(i))
             self._handles.append(h2)
+            h3 = blk.register_forward_pre_hook(self._make_input_hook(i))
+            self._handles.append(h3)
 
     def _make_feat_hook(self, layer_idx):
         def hook(module, input, output):
-            if isinstance(output, tuple):
+            if isinstance(output, tuple) and len(output) >= 3:
                 self.features[layer_idx] = output[0].detach()
+                if len(output) >= 3 and output[2] is not None:
+                    self.global_index_s[layer_idx] = output[2].detach()
+                else:
+                    self.global_index_s[layer_idx] = None
             else:
-                self.features[layer_idx] = output.detach()
+                self.features[layer_idx] = output.detach() if isinstance(output, torch.Tensor) else None
+                self.global_index_s[layer_idx] = None
+        return hook
+
+    def _make_input_hook(self, layer_idx):
+        def hook(module, input):
+            if isinstance(input, tuple):
+                self.inputs[layer_idx] = input[0].detach()
+            else:
+                self.inputs[layer_idx] = input.detach()
         return hook
 
     def _make_attn_hook(self, layer_idx):
@@ -263,7 +332,9 @@ class LayerHook:
 
     def clear(self):
         self.features.clear()
+        self.inputs.clear()
         self.attns.clear()
+        self.global_index_s.clear()
 
     def remove(self):
         for h in self._handles:
@@ -316,6 +387,7 @@ def run_forward_no_prompt(model, z_tensor, x_tensor, hook):
         x, global_index_t, global_index_s, _, attn = blk(
             x, global_index_t, global_index_s)
         hook.features[i] = x.detach()
+        hook.global_index_s[i] = global_index_s.detach() if global_index_s is not None else None
         if attn is not None:
             hook.attns[i] = attn.detach()
 
@@ -323,24 +395,43 @@ def run_forward_no_prompt(model, z_tensor, x_tensor, hook):
 
 
 def extract_search_tokens(feature, lens_z, lens_x, cat_mode, feat_sz):
-    """从合并特征中提取Search Tokens"""
+    """从合并特征中提取Search Tokens (适配CE剪枝: search token数量可能减少)"""
+    if feature is None:
+        return None
+    actual_len = feature.shape[1]
     if cat_mode == 'direct':
-        search_tokens = feature[:, lens_z:lens_z + lens_x]
+        search_tokens = feature[:, lens_z:]
     elif cat_mode == 'template_central':
         central_pivot = lens_x // 2
         first_half = feature[:, :central_pivot, :]
         second_half = feature[:, central_pivot + lens_z:, :]
         search_tokens = torch.cat([first_half, second_half], dim=1)
     else:
-        search_tokens = feature[:, lens_z:lens_z + lens_x]
+        search_tokens = feature[:, lens_z:]
     return search_tokens
 
 
-def draw_heatmap_overlay(srch_rgb, heatmap, gt_box_in_search=None, score_max_pos=None):
-    """绘制热力图叠加"""
+def draw_heatmap_overlay(srch_rgb, heatmap, gt_box_in_search=None, score_max_pos=None,
+                         alpha=0.55, vmin=None, vmax=None):
+    """绘制热力图叠加
+    
+    Args:
+        alpha: 热力图混合权重 (默认0.55，提高区分度)
+        vmin/vmax: 归一化范围，用于在图上标注
+    """
     heatmap_color = cv2.applyColorMap((heatmap * 255).astype(np.uint8), cv2.COLORMAP_JET)
     heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
-    blended = (0.4 * heatmap_color.astype(float) + 0.6 * srch_rgb.astype(float)).astype(np.uint8)
+    blended = (alpha * heatmap_color.astype(float) + (1 - alpha) * srch_rgb.astype(float)).astype(np.uint8)
+    if gt_box_in_search is not None:
+        x1, y1, w, h = [int(v) for v in gt_box_in_search]
+        cv2.rectangle(blended, (x1, y1), (x1+w, y1+h), (0, 255, 0), 2)
+    if score_max_pos is not None:
+        px, py = int(score_max_pos[0]), int(score_max_pos[1])
+        cv2.circle(blended, (px, py), 5, (255, 0, 0), -1)
+    if vmin is not None and vmax is not None:
+        info_text = f"[{vmin:.3f},{vmax:.3f}]"
+        cv2.putText(blended, info_text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+        cv2.putText(blended, info_text, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
     return blended
 
 
@@ -362,7 +453,11 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
 
     model = build_viptrack(cfg, training=False)
     ckpt = torch.load(ckpt_path, map_location='cpu')
-    model.load_state_dict(ckpt.get('model', ckpt.get('net', ckpt)), strict=False)
+    load_result = model.load_state_dict(ckpt.get('model', ckpt.get('net', ckpt)), strict=False)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[模型] params={n_params:,}, missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}")
+    if load_result.missing_keys:
+        print(f"[模型] ⚠ missing_keys: {load_result.missing_keys[:5]}...")
     model = model.cuda().eval()
 
     backbone = model.backbone
@@ -373,7 +468,8 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
     lens_x = backbone.pos_embed_x.shape[1]
 
     layers = parse_layers(args.layers, depth)
-    print(f"[配置] depth={depth}, cat_mode={cat_mode}, feat_sz_s={feat_sz_s}")
+    meta_prompt = getattr(cfg.MODEL.BACKBONE, 'META_PROMPT', False)
+    print(f"[配置] depth={depth}, cat_mode={cat_mode}, feat_sz_s={feat_sz_s}, meta_prompt={meta_prompt}")
     print(f"[配置] lens_z={lens_z}, lens_x={lens_x}")
     print(f"[配置] 可视化层: {layers}")
 
@@ -420,6 +516,19 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
         features_prompt = dict(hook.features)
         attns_prompt = dict(hook.attns)
 
+        # 诊断: 输出特征hash和score
+        import hashlib
+        if frame_i == 0:
+            for li in [0, 6, 11]:
+                f = features_prompt.get(li)
+                if f is not None:
+                    h = hashlib.md5(f.cpu().numpy().tobytes()).hexdigest()[:10]
+                    print(f"[诊断] Layer{li} feat_hash={h}, mean={f.mean():.4f}")
+            sm = out_dict.get('score_map')
+            if sm is not None:
+                s = sm[0] if sm.dim()==3 else sm[0,0]
+                print(f"[诊断] score_map: max={s.max():.4f}, mean={s.mean():.4f}")
+
         # ====== 无Prompt前向 (仅RGB) ======
         features_no_prompt = None
         attns_no_prompt = None
@@ -452,79 +561,117 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
 
         # ====== 逐层可视化 ======
         srch_rgb = x_patch_arr[:, :, :3]
+        inputs_prompt = dict(hook.inputs)
+        global_indices_prompt = dict(hook.global_index_s)
 
-        n_cols = 3 if args.show_prompt else 2
+        gt_bbox_in_search = None
+        cur_bbox = init_bbox if frame_i == 0 else state
+        if cur_bbox is not None:
+            cx_gt = cur_bbox[0] + cur_bbox[2] / 2
+            cy_gt = cur_bbox[1] + cur_bbox[3] / 2
+            crop_sz = math.ceil(math.sqrt(cur_bbox[2] * cur_bbox[3]) * search_factor)
+            cx_crop = cur_bbox[0] + cur_bbox[2] / 2
+            cy_crop = cur_bbox[1] + cur_bbox[3] / 2
+            x1_crop = round(cx_crop - crop_sz * 0.5)
+            y1_crop = round(cy_crop - crop_sz * 0.5)
+            gt_x1_s = (cx_gt - cur_bbox[2] / 2 - x1_crop) * (search_size / crop_sz)
+            gt_y1_s = (cy_gt - cur_bbox[3] / 2 - y1_crop) * (search_size / crop_sz)
+            gt_w_s = cur_bbox[2] * (search_size / crop_sz)
+            gt_h_s = cur_bbox[3] * (search_size / crop_sz)
+            gt_bbox_in_search = [gt_x1_s, gt_y1_s, gt_w_s, gt_h_s]
+
+        n_cols = 4 if args.show_prompt else 3
         n_rows = len(layers)
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.5 * n_rows))
         if n_rows == 1:
             axes = axes.reshape(1, -1)
 
         for row_i, layer_idx in enumerate(layers):
-            feat = features_prompt.get(layer_idx)
+            feat_in = inputs_prompt.get(layer_idx)
+            feat_out = features_prompt.get(layer_idx)
             attn = attns_prompt.get(layer_idx)
+            gidx_out = global_indices_prompt.get(layer_idx)
+            gidx_in = global_indices_prompt.get(layer_idx - 1) if layer_idx > 0 else None
 
-            # 提取Search Tokens
-            search_tokens = None
-            if feat is not None:
-                search_tokens = extract_search_tokens(feat, lens_z, lens_x, cat_mode, feat_sz_s)
+            st_in = extract_search_tokens(feat_in, lens_z, lens_x, cat_mode, feat_sz_s) if feat_in is not None else None
+            st_out = extract_search_tokens(feat_out, lens_z, lens_x, cat_mode, feat_sz_s) if feat_out is not None else None
 
-            # 列0: 特征热力图 (Token均值)
+            # 列0: Block输入
             ax = axes[row_i, 0]
-            if search_tokens is not None:
-                hm = token_to_heatmap(search_tokens, feat_sz_s, search_size)
-                blended = draw_heatmap_overlay(srch_rgb, hm)
-                ax.imshow(blended)
-                ax.set_title(f'Layer {layer_idx} | Feature Heatmap', fontsize=11)
+            if st_in is not None:
+                hm_in, vmin_in, vmax_in = token_to_heatmap(
+                    st_in, feat_sz_s, search_size, global_index_s=gidx_in, gt_bbox_in_search=gt_bbox_in_search)
+                ax.imshow(draw_heatmap_overlay(srch_rgb, hm_in))
+                ax.set_title(f'L{layer_idx} Input [{vmin_in:.2f},{vmax_in:.2f}]', fontsize=10)
             else:
-                ax.text(0.5, 0.5, 'N/A', ha='center', va='center', fontsize=14)
-                ax.set_title(f'Layer {layer_idx} | No Feature', fontsize=11)
+                ax.imshow(srch_rgb.astype(np.uint8))
+                ax.set_title(f'L{layer_idx} Input N/A', fontsize=10)
+            ax.axis('off')
 
-            # 列1: 注意力热力图
+            # 列1: Block输出
             ax = axes[row_i, 1]
+            if st_out is not None:
+                hm_out, vmin_o, vmax_o = token_to_heatmap(
+                    st_out, feat_sz_s, search_size, global_index_s=gidx_out, gt_bbox_in_search=gt_bbox_in_search)
+                ax.imshow(draw_heatmap_overlay(srch_rgb, hm_out))
+                ax.set_title(f'L{layer_idx} Output [{vmin_o:.2f},{vmax_o:.2f}]', fontsize=10)
+            else:
+                ax.imshow(srch_rgb.astype(np.uint8))
+                ax.set_title(f'L{layer_idx} Output N/A', fontsize=10)
+            ax.axis('off')
+
+            # 列2: 注意力热力图
+            ax = axes[row_i, 2]
             if attn is not None:
                 hm_attn = attn_to_heatmap(attn, lens_z, feat_sz_s, search_size)
                 if hm_attn is not None:
-                    blended = draw_heatmap_overlay(srch_rgb, hm_attn)
-                    ax.imshow(blended)
-                    ax.set_title(f'Layer {layer_idx} | Attention Map', fontsize=11)
+                    ax.imshow(draw_heatmap_overlay(srch_rgb, hm_attn))
+                    ax.set_title(f'L{layer_idx} Attention', fontsize=10)
                 else:
                     ax.imshow(srch_rgb.astype(np.uint8))
-                    ax.set_title(f'Layer {layer_idx} | Attn N/A', fontsize=11)
+                    ax.set_title(f'L{layer_idx} Attn N/A', fontsize=10)
             else:
                 ax.imshow(srch_rgb.astype(np.uint8))
-                ax.set_title(f'Layer {layer_idx} | No Attn', fontsize=11)
+                ax.set_title(f'L{layer_idx} No Attn', fontsize=10)
+            ax.axis('off')
 
-            # 列2: Prompt前后对比 (可选)
-            if args.show_prompt and n_cols >= 3:
-                ax = axes[row_i, 2]
+            # 列3: Prompt前后对比
+            if args.show_prompt and n_cols >= 4:
+                ax = axes[row_i, 3]
                 feat_no = features_no_prompt.get(layer_idx) if features_no_prompt else None
-                if feat_no is not None and search_tokens is not None:
-                    search_tokens_no = extract_search_tokens(feat_no, lens_z, lens_x, cat_mode, feat_sz_s)
-                    hm_prompt = token_to_heatmap(search_tokens, feat_sz_s, search_size)
-                    hm_no_prompt = token_to_heatmap(search_tokens_no, feat_sz_s, search_size)
-                    diff = np.abs(hm_prompt - hm_no_prompt)
+                if feat_no is not None and st_out is not None:
+                    st_no = extract_search_tokens(feat_no, lens_z, lens_x, cat_mode, feat_sz_s)
+                    hm_p, _, _ = token_to_heatmap(
+                        st_out, feat_sz_s, search_size, global_index_s=gidx_out, gt_bbox_in_search=gt_bbox_in_search)
+                    hm_n, _, _ = token_to_heatmap(
+                        st_no, feat_sz_s, search_size, gt_bbox_in_search=gt_bbox_in_search)
+                    diff = np.abs(hm_p - hm_n)
                     diff_norm = (diff - diff.min()) / (diff.max() - diff.min() + 1e-8)
                     diff_color = cv2.applyColorMap((diff_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
                     diff_color = cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB)
                     blended_diff = (0.5 * diff_color.astype(float) + 0.5 * srch_rgb.astype(float)).astype(np.uint8)
                     ax.imshow(blended_diff)
-                    ax.set_title(f'Layer {layer_idx} | Prompt Diff', fontsize=11)
+                    ax.set_title(f'L{layer_idx} Prompt Δ', fontsize=10)
                 else:
                     ax.imshow(srch_rgb.astype(np.uint8))
-                    ax.set_title(f'Layer {layer_idx} | No Diff', fontsize=11)
-
-            for ax in axes[row_i]:
+                    ax.set_title(f'L{layer_idx} No Diff', fontsize=10)
                 ax.axis('off')
 
-        col_labels = ['Feature Heatmap', 'Attention Map']
+        col_labels = ['Block Input', 'Block Output', 'Attention']
         if args.show_prompt:
-            col_labels.append('|Prompt-RGB| Diff')
+            col_labels.append('Prompt Δ')
+
+        for ci, clabel in enumerate(col_labels):
+            fig.text(0.5 / n_cols + ci / n_cols, 0.99, clabel,
+                     ha='center', va='top', fontsize=12, fontweight='bold',
+                     transform=fig.transFigure)
+
         sm_max_str = f'{sm_final.max():.3f}' if sm_final is not None else 'N/A'
         plt.suptitle(
             f'Frame {frame_i} | {exp_name}\n'
             f'Layers: {layers} | Score_max={sm_max_str}',
             fontsize=13, fontweight='bold')
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
         fpath = os.path.join(out_dir, f'frame_{frame_i:02d}_layers.png')
         plt.savefig(fpath, dpi=150, bbox_inches='tight')
         plt.close()
@@ -536,40 +683,59 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
 
         for layer_idx in layers:
             feat = features_prompt.get(layer_idx)
+            feat_in = inputs_prompt.get(layer_idx)
             attn = attns_prompt.get(layer_idx)
+            gidx_out = global_indices_prompt.get(layer_idx)
+            gidx_in = global_indices_prompt.get(layer_idx - 1) if layer_idx > 0 else None
 
-            fig_l, axes_l = plt.subplots(1, 2 + (1 if args.show_prompt else 0),
-                                          figsize=(7 * (2 + (1 if args.show_prompt else 0)), 6))
+            n_cols_single = 3 + (1 if args.show_prompt else 0)
+            fig_l, axes_l = plt.subplots(1, n_cols_single,
+                                          figsize=(6 * n_cols_single, 5.5))
 
-            # Feature Heatmap
             ax = axes_l[0]
+            if feat_in is not None:
+                st_in = extract_search_tokens(feat_in, lens_z, lens_x, cat_mode, feat_sz_s)
+                hm_in, vmin_in, vmax_in = token_to_heatmap(
+                    st_in, feat_sz_s, search_size, global_index_s=gidx_in, gt_bbox_in_search=gt_bbox_in_search)
+                blended_in = draw_heatmap_overlay(srch_rgb, hm_in)
+                ax.imshow(blended_in)
+                ax.set_title(f'Block Input [{vmin_in:.2f},{vmax_in:.2f}]', fontsize=11)
+            else:
+                ax.imshow(srch_rgb.astype(np.uint8))
+                ax.set_title('Block Input (N/A)', fontsize=11)
+            ax.axis('off')
+
+            ax = axes_l[1]
             if feat is not None:
                 search_tokens = extract_search_tokens(feat, lens_z, lens_x, cat_mode, feat_sz_s)
-                hm = token_to_heatmap(search_tokens, feat_sz_s, search_size)
+                hm, hvmin, hvmax = token_to_heatmap(
+                    search_tokens, feat_sz_s, search_size, global_index_s=gidx_out, gt_bbox_in_search=gt_bbox_in_search)
                 blended = draw_heatmap_overlay(srch_rgb, hm)
                 ax.imshow(blended)
-            ax.set_title(f'Feature Heatmap', fontsize=12)
+                ax.set_title(f'Block Output [{hvmin:.2f},{hvmax:.2f}]', fontsize=11)
             ax.axis('off')
 
             # Attention Map
-            ax = axes_l[1]
+            ax = axes_l[2]
             if attn is not None:
                 hm_attn = attn_to_heatmap(attn, lens_z, feat_sz_s, search_size)
                 if hm_attn is not None:
                     blended = draw_heatmap_overlay(srch_rgb, hm_attn)
                     ax.imshow(blended)
-            ax.set_title(f'Attention Map', fontsize=12)
+            ax.set_title('Attention Map', fontsize=11)
             ax.axis('off')
 
             # Prompt Diff
             if args.show_prompt:
-                ax = axes_l[2]
+                ax = axes_l[3]
                 feat_no = features_no_prompt.get(layer_idx) if features_no_prompt else None
                 if feat_no is not None and feat is not None:
                     st_prompt = extract_search_tokens(feat, lens_z, lens_x, cat_mode, feat_sz_s)
                     st_no = extract_search_tokens(feat_no, lens_z, lens_x, cat_mode, feat_sz_s)
-                    hm_p = token_to_heatmap(st_prompt, feat_sz_s, search_size)
-                    hm_n = token_to_heatmap(st_no, feat_sz_s, search_size)
+                    hm_p, _, _ = token_to_heatmap(
+                        st_prompt, feat_sz_s, search_size, global_index_s=gidx_out, gt_bbox_in_search=gt_bbox_in_search)
+                    hm_n, _, _ = token_to_heatmap(
+                        st_no, feat_sz_s, search_size, gt_bbox_in_search=gt_bbox_in_search)
                     diff = np.abs(hm_p - hm_n)
                     diff_norm = (diff - diff.min()) / (diff.max() - diff.min() + 1e-8)
                     diff_color = cv2.applyColorMap((diff_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
@@ -704,6 +870,321 @@ def run_single_experiment(args, cfg_path, ckpt_path, exp_name):
         print(f"  Prompt Diff       - |有Prompt - 无Prompt| 差异热力图")
 
 
+def run_comparison(args, experiments):
+    """跨实验对比模式: 所有实验用同一输入，共享colorbar并排显示所有层"""
+    import hashlib
+
+    print(f"\n{'='*60}")
+    print(f"[对比模式] {len(experiments)} 个实验 并排对比")
+    print(f"{'='*60}")
+
+    frames, gt_list = load_video(args.video_idx, max_frames=1)
+    if not frames or len(frames) == 0:
+        print("[对比] 无法读取视频帧")
+        return
+
+    frame_6ch = frames[0]
+    init_bbox = gt_list[0] if gt_list and gt_list[0] else [
+        frame_6ch.shape[1] // 4, frame_6ch.shape[0] // 4,
+        frame_6ch.shape[1] // 2, frame_6ch.shape[0] // 2]
+
+    n_exp = len(experiments)
+    all_results = {}
+
+    for i, (cfg_path, ckpt_path, exp_name) in enumerate(experiments):
+        print(f"[对比] ({i+1}/{n_exp}) 加载: {exp_name}")
+        try:
+            cfg = edict(yaml.safe_load(open(cfg_path)))
+            if 'TEST' not in cfg:
+                cfg.TEST = edict()
+            for k in ['TEMPLATE_FACTOR', 'TEMPLATE_SIZE', 'SEARCH_FACTOR', 'SEARCH_SIZE']:
+                setattr(cfg.TEST, k, getattr(cfg.TEST, k,
+                    [2.0, 128, 4.0, 256][['TEMPLATE_FACTOR', 'TEMPLATE_SIZE', 'SEARCH_FACTOR', 'SEARCH_SIZE'].index(k)]))
+
+            model = build_viptrack(cfg, training=False)
+            ckpt = torch.load(ckpt_path, map_location='cpu')
+            load_result = model.load_state_dict(ckpt.get('model', ckpt.get('net', ckpt)), strict=False)
+            meta_prompt = getattr(cfg.MODEL.BACKBONE, 'META_PROMPT', False)
+            model = model.cuda().eval()
+
+            backbone = model.backbone
+            depth = backbone.depth
+            feat_sz_s = model.feat_sz_s
+            lens_z = backbone.pos_embed_z.shape[1]
+            lens_x = backbone.pos_embed_x.shape[1]
+            cat_mode = backbone.cat_mode
+            search_size = cfg.TEST.SEARCH_SIZE
+            search_factor = cfg.TEST.SEARCH_FACTOR
+
+            preprocessor = PreprocessorMM()
+            x_patch_arr, _ = sample_target(frame_6ch, init_bbox, search_factor, output_sz=search_size)
+            z_patch_arr, _ = sample_target(frame_6ch, init_bbox,
+                                           getattr(cfg.TEST, 'TEMPLATE_FACTOR', 2.0),
+                                           output_sz=getattr(cfg.TEST, 'TEMPLATE_SIZE', 128))
+            x_tensor = preprocessor.process(x_patch_arr)
+            z_tensor = preprocessor.process(z_patch_arr)
+
+            hook = LayerHook()
+            hook.register(model)
+            with torch.no_grad():
+                out_dict = model(z_tensor, x_tensor)
+
+            features_with_prompt = dict(hook.features)
+            inputs_with_prompt = dict(hook.inputs)
+            global_indices_with_prompt = dict(hook.global_index_s)
+
+            hook_no = LayerHook()
+            hook_no.register(model)
+            run_forward_no_prompt(model, z_tensor, x_tensor, hook_no)
+
+            layer_data = {}
+            for li in range(depth):
+                feat_out = features_with_prompt.get(li)
+                feat_in = inputs_with_prompt.get(li)
+                feat_no = hook_no.features.get(li)
+                gidx_out = global_indices_with_prompt.get(li)
+                gidx_in = global_indices_with_prompt.get(li - 1) if li > 0 else None
+                entry = {}
+                if feat_out is not None:
+                    st = extract_search_tokens(feat_out, lens_z, lens_x, cat_mode, feat_sz_s)
+                    entry['output_raw'] = st[0].mean(dim=-1).detach().cpu().numpy()
+                    entry['output_gidx'] = gidx_out
+                if feat_in is not None:
+                    st_in = extract_search_tokens(feat_in, lens_z, lens_x, cat_mode, feat_sz_s)
+                    entry['input_raw'] = st_in[0].mean(dim=-1).detach().cpu().numpy()
+                    entry['input_gidx'] = gidx_in
+                if feat_no is not None:
+                    st_no = extract_search_tokens(feat_no, lens_z, lens_x, cat_mode, feat_sz_s)
+                    entry['noprompt_raw'] = st_no[0].mean(dim=-1).detach().cpu().numpy()
+                    entry['noprompt_gidx'] = gidx_out
+                if entry:
+                    layer_data[li] = entry
+
+            sm = out_dict.get('score_map')
+            score_max = sm[0].max().item() if sm is not None else 0
+
+            all_results[exp_name] = {
+                'layer_data': layer_data,
+                'depth': depth,
+                'score_max': score_max,
+                'meta_prompt': meta_prompt,
+                'missing_keys': len(load_result.missing_keys),
+                'feat_sz_s': feat_sz_s,
+                'search_size': search_size
+            }
+            hook.remove()
+            hook_no.remove()
+            del model
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[对比] ❌ {exp_name} 失败: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if len(all_results) < 2:
+        print("[对比] 成功加载的实验不足2个，无法对比")
+        return
+
+    rgb_orig = frame_6ch[:, :, :3]
+    srch_rgb = cv2.resize(rgb_orig, (search_size, search_size))
+    cmp_dir = os.path.join(_project_root, args.output_dir, '_compare')
+    os.makedirs(cmp_dir, exist_ok=True)
+
+    depth = list(all_results.values())[0]['depth']
+
+    def _raw_to_hm(raw, fsz, ssz, g_lo, g_hi, gidx=None):
+        h = w = fsz
+        total_tokens = h * w
+        feat_map = np.zeros(total_tokens, dtype=np.float32)
+        if gidx is not None:
+            idx = gidx.cpu().numpy().astype(np.int64) if isinstance(gidx, torch.Tensor) else np.array(gidx, dtype=np.int64)
+            if idx.ndim > 1:
+                idx = idx[0]
+            if len(idx) == len(raw):
+                valid_mask = (idx >= 0) & (idx < total_tokens)
+                feat_map[idx[valid_mask]] = raw[valid_mask]
+            else:
+                feat_map[:min(len(raw), total_tokens)] = raw[:min(len(raw), total_tokens)]
+        else:
+            feat_map[:min(len(raw), total_tokens)] = raw[:min(len(raw), total_tokens)]
+        feat_map = feat_map.reshape(h, w)
+        clip_raw = np.clip(feat_map, g_lo, g_hi)
+        normed = (clip_raw - g_lo) / (g_hi - g_lo + 1e-8)
+        return cv2.resize(normed.astype(np.float32), (ssz, ssz))
+
+    # 图1: 所有层输出对比 (每行1层, 每列1实验)
+    for view_name, key in [('Output', 'output_raw'), ('Input', 'input_raw'), ('NoPrompt', 'noprompt_raw')]:
+        global_vals = []
+        for exp_name, res in all_results.items():
+            for li in range(depth):
+                ld = res['layer_data'].get(li, {})
+                if key in ld:
+                    global_vals.append(ld[key])
+        if not global_vals:
+            continue
+        all_concat = np.concatenate(global_vals)
+        g_lo, g_hi = np.percentile(all_concat, [1, 99])
+        if g_hi - g_lo < 1e-8:
+            g_lo, g_hi = all_concat.min(), all_concat.max()
+
+        n_rows = depth
+        n_cols = n_exp + 2
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3 * n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+
+        for row_i in range(depth):
+            row_hms = []
+            for col, (exp_name, res) in enumerate(all_results.items()):
+                ax = axes[row_i, col]
+                ld = res['layer_data'].get(row_i, {})
+                raw = ld.get(key)
+                gidx_key = key.replace('_raw', '_gidx')
+                gidx = ld.get(gidx_key)
+                if raw is not None:
+                    hm = _raw_to_hm(raw, res['feat_sz_s'], res['search_size'], g_lo, g_hi, gidx=gidx)
+                    row_hms.append(hm)
+                    ax.imshow(draw_heatmap_overlay(srch_rgb, hm, alpha=0.55, vmin=g_lo, vmax=g_hi))
+                    if row_i == 0:
+                        tag = "META" if res['meta_prompt'] else "BASE"
+                        miss = f" m{res['missing_keys']}" if res['missing_keys'] > 0 else ""
+                        ax.set_title(f'{exp_name[:16]}\n{tag}{miss}', fontsize=8)
+                else:
+                    ax.imshow(srch_rgb.astype(np.uint8))
+                    row_hms.append(None)
+                if col == 0:
+                    ax.set_ylabel(f'L{row_i}', fontsize=9, fontweight='bold')
+                ax.axis('off')
+
+            # 差值列: 各实验与第一个实验的像素差异
+            ax_diff = axes[row_i, n_exp]
+            ref_hm = row_hms[0]
+            if ref_hm is not None and len([h for h in row_hms[1:] if h is not None]) > 0:
+                diff_max = np.zeros_like(ref_hm)
+                for hm in row_hms[1:]:
+                    if hm is not None:
+                        diff_max = np.maximum(diff_max, np.abs(hm - ref_hm))
+                d_lo_local, d_hi_local = np.percentile(diff_max, [5, 95])
+                if d_hi_local - d_lo_local < 1e-8:
+                    d_lo_local, d_hi_local = 0, diff_max.max()
+                diff_norm = np.clip((diff_max - d_lo_local) / (d_hi_local - d_lo_local + 1e-8), 0, 1)
+                diff_color = cv2.applyColorMap((diff_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+                diff_color = cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB)
+                blended_diff = (0.6 * diff_color.astype(float) + 0.4 * srch_rgb.astype(float)).astype(np.uint8)
+                ax_diff.imshow(blended_diff)
+                max_val = diff_max.max()
+                ax_diff.text(0.02, 0.96, f'max={max_val:.3f}', transform=ax_diff.transAxes,
+                            fontsize=7, color='white',
+                            bbox=dict(boxstyle='round', facecolor='black', alpha=0.6))
+            else:
+                ax_diff.imshow(srch_rgb.astype(np.uint8))
+            if row_i == 0:
+                ax_diff.set_title('Inter-Exp\nDiff', fontsize=8)
+            ax_diff.axis('off')
+
+            # colorbar列
+            ax_cb = axes[row_i, n_exp + 1]
+            sm_cb = plt.cm.ScalarMappable(cmap='jet', norm=plt.Normalize(vmin=g_lo, vmax=g_hi))
+            sm_cb.set_array([])
+            cbar = fig.colorbar(sm_cb, cax=ax_cb)
+
+        plt.suptitle(f'Cross-Exp {view_name} | Shared [{g_lo:.3f},{g_hi:.3f}]',
+                     fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        fpath = os.path.join(cmp_dir, f'all_layers_{key}.png')
+        plt.savefig(fpath, dpi=120, bbox_inches='tight')
+        plt.close()
+        print(f"✅ 对比图: {fpath}")
+
+    # 图2: Prompt差异对比 (每行1层, 每列1实验)
+    diff_global = []
+    for exp_name, res in all_results.items():
+        for li in range(depth):
+            ld = res['layer_data'].get(li, {})
+            if 'output_raw' in ld and 'noprompt_raw' in ld:
+                diff_global.append(np.abs(ld['output_raw'] - ld['noprompt_raw']))
+    if diff_global:
+        diff_concat = np.concatenate(diff_global)
+        d_lo, d_hi = np.percentile(diff_concat, [1, 99])
+        if d_hi - d_lo < 1e-8:
+            d_lo, d_hi = diff_concat.min(), diff_concat.max()
+
+        fig, axes = plt.subplots(depth, n_exp + 1, figsize=(3.5 * (n_exp + 1), 3 * depth))
+        if depth == 1:
+            axes = axes.reshape(1, -1)
+
+        for row_i in range(depth):
+            for col, (exp_name, res) in enumerate(all_results.items()):
+                ax = axes[row_i, col]
+                ld = res['layer_data'].get(row_i, {})
+                if 'output_raw' in ld and 'noprompt_raw' in ld:
+                    diff = np.abs(ld['output_raw'] - ld['noprompt_raw'])
+                    gidx = ld.get('output_gidx')
+                    hm = _raw_to_hm(diff, res['feat_sz_s'], res['search_size'], d_lo, d_hi, gidx=gidx)
+                    diff_color = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+                    diff_color = cv2.cvtColor(diff_color, cv2.COLOR_BGR2RGB)
+                    blended = (0.5 * diff_color.astype(float) + 0.5 * srch_rgb.astype(float)).astype(np.uint8)
+                    ax.imshow(blended)
+                    if row_i == 0:
+                        ax.set_title(exp_name[:18], fontsize=8)
+                else:
+                    ax.imshow(srch_rgb.astype(np.uint8))
+                if col == 0:
+                    ax.set_ylabel(f'L{row_i}', fontsize=9, fontweight='bold')
+                ax.axis('off')
+
+            ax_cb = axes[row_i, n_exp]
+            sm_cb = plt.cm.ScalarMappable(cmap='hot', norm=plt.Normalize(vmin=d_lo, vmax=d_hi))
+            sm_cb.set_array([])
+            cbar = fig.colorbar(sm_cb, cax=ax_cb)
+
+        plt.suptitle(f'Prompt Injection Effect | |Output - NoPrompt| | Shared [{d_lo:.4f},{d_hi:.4f}]',
+                     fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        fpath = os.path.join(cmp_dir, 'all_layers_prompt_diff.png')
+        plt.savefig(fpath, dpi=120, bbox_inches='tight')
+        plt.close()
+        print(f"✅ 对比图: {fpath}")
+
+    # 图3: 逐层统计折线图
+    fig_stat, (ax_mean, ax_diff) = plt.subplots(1, 2, figsize=(14, 5))
+    for exp_name, res in all_results.items():
+        means, stds, diffs = [], [], []
+        for li in range(depth):
+            ld = res['layer_data'].get(li, {})
+            if 'output_raw' in ld:
+                means.append(ld['output_raw'].mean())
+                stds.append(ld['output_raw'].std())
+            else:
+                means.append(0); stds.append(0)
+            if 'output_raw' in ld and 'noprompt_raw' in ld:
+                diffs.append(np.abs(ld['output_raw'] - ld['noprompt_raw']).mean())
+            else:
+                diffs.append(0)
+        tag = "META" if res['meta_prompt'] else "BASE"
+        ax_mean.plot(range(depth), means, 'o-', label=f'{exp_name[:15]}({tag})', markersize=4)
+        ax_diff.plot(range(depth), diffs, 'o-', label=f'{exp_name[:15]}({tag})', markersize=4)
+    ax_mean.set_xlabel('Layer'); ax_mean.set_ylabel('Mean Activation'); ax_mean.legend(fontsize=7)
+    ax_mean.set_title('Per-Layer Output Mean'); ax_mean.grid(True, alpha=0.3)
+    ax_diff.set_xlabel('Layer'); ax_diff.set_ylabel('|Prompt - NoPrompt| Mean'); ax_diff.legend(fontsize=7)
+    ax_diff.set_title('Per-Layer Prompt Injection Effect'); ax_diff.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fpath = os.path.join(cmp_dir, 'per_layer_stats.png')
+    plt.savefig(fpath, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"✅ 统计图: {fpath}")
+
+    print(f"\n{'='*60}")
+    print(f"[对比] 特征Hash汇总 (Layer6):")
+    for exp_name, res in all_results.items():
+        ld = res['layer_data'].get(6, {})
+        if 'output_raw' in ld:
+            h = hashlib.md5(ld['output_raw'].tobytes()).hexdigest()[:10]
+            print(f"  {exp_name}: hash={h}, mean={ld['output_raw'].mean():.4f}, score={res['score_max']:.4f}")
+    print(f"{'='*60}")
+
+
 def main():
     args = parse_args()
 
@@ -732,6 +1213,9 @@ def main():
         print(f"\n{'='*60}")
         print(f"[批量] 全部完成! 共 {len(experiments)} 个实验")
         print(f"{'='*60}")
+
+        if args.compare:
+            run_comparison(args, experiments)
     else:
         exp_name = os.path.basename(os.path.dirname(args.checkpoint))
         run_single_experiment(args, args.config, args.checkpoint, exp_name)
