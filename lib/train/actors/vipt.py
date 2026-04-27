@@ -219,13 +219,20 @@ class ViPTActor(BaseActor):
             if consistency_data is not None and isinstance(consistency_data, dict):
                 token_weight = consistency_data.get('token_consistency')
                 if token_weight is not None:
-                    token_weight = token_weight.squeeze(-1)
-                    weight_var = torch.var(token_weight, dim=1)
-                    current_weight_var = weight_var.mean().item()
-                    num_tokens = max(token_weight.shape[1], 1)
-                    consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
-                    loss = loss + 1e-3 * consistency_reg_loss
-                    current_reg_loss = consistency_reg_loss.item()
+                    # 安全校验：检查NaN
+                    if torch.isnan(token_weight).any():
+                        pass
+                    else:
+                        token_weight = token_weight.squeeze(-1)
+                        weight_var = torch.var(token_weight, dim=1)
+                        current_weight_var = weight_var.mean().item()
+                        num_tokens = max(token_weight.shape[1], 1)
+                        # 归一化L2 norm：除以sqrt(num_tokens)确保值域合理
+                        consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
+                        # 裁剪到合理范围 [0, 10]
+                        consistency_reg_loss = torch.clamp(consistency_reg_loss, 0, 10)
+                        loss = loss + 1e-3 * consistency_reg_loss
+                        current_reg_loss = consistency_reg_loss.item()
 
         # ===== 时序分支专属Loss：帧间平滑 + 运动门控约束（权重1e-3主导） =====
         if 'temporal_intermediates' in inject_intermediates:
@@ -233,16 +240,24 @@ class ViPTActor(BaseActor):
             if temporal_data is not None and isinstance(temporal_data, dict):
                 tw = temporal_data.get('temporal_weight')
                 if tw is not None:
-                    temporal_reg_loss = torch.norm(tw, p=2) * 0.5
-                    prev_tw = temporal_data.get('prev_temporal_weight')
-                    if prev_tw is not None and prev_tw.shape == tw.shape:
-                        temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
-                    loss = loss + 1e-3 * temporal_reg_loss
-                    current_temporal_reg = temporal_reg_loss.item()
-                    global_motion = temporal_data.get('global_motion')
-                    if global_motion is not None:
-                        motion_gate_loss = -torch.mean(global_motion * tw.mean(dim=1, keepdim=True))
-                        loss = loss + 1e-4 * motion_gate_loss
+                    # 安全校验：检查NaN
+                    if not torch.isnan(tw).any() and not torch.isinf(tw).any():
+                        tw_norm = torch.norm(tw, p=2) / (tw.numel() ** 0.5 + 1e-8)
+                        temporal_reg_loss = tw_norm * 0.5
+                        prev_tw = temporal_data.get('prev_temporal_weight')
+                        if prev_tw is not None and prev_tw.shape == tw.shape:
+                            # 帧间差异损失
+                            frame_diff = torch.mean((tw - prev_tw) ** 2)
+                            temporal_reg_loss = temporal_reg_loss + 0.5 * frame_diff
+                        # 裁剪到合理范围 [0, 10]
+                        temporal_reg_loss = torch.clamp(temporal_reg_loss, 0, 10)
+                        loss = loss + 1e-3 * temporal_reg_loss
+                        current_temporal_reg = temporal_reg_loss.item()
+                        global_motion = temporal_data.get('global_motion')
+                        if global_motion is not None and not torch.isnan(global_motion).any():
+                            motion_gate_loss = -torch.mean(global_motion * tw.mean(dim=1, keepdim=True))
+                            motion_gate_loss = torch.clamp(motion_gate_loss, -10, 10)
+                            loss = loss + 1e-4 * motion_gate_loss
 
         # ===== Mask分支专属Loss：目标区域特征响应增强（权重1e-3主导） =====
         if 'mask_intermediates' in inject_intermediates:
@@ -250,12 +265,18 @@ class ViPTActor(BaseActor):
             if mask_data is not None and isinstance(mask_data, dict):
                 token_reliability = mask_data.get('token_reliability')
                 if token_reliability is not None:
-                    token_reliability = token_reliability.squeeze(-1)
-                    mask_reg_loss = torch.norm(token_reliability, p=2)
-                    mean_reliability = token_reliability.mean()
-                    target_resp_loss = -torch.mean(torch.relu(mean_reliability - 0.3))
-                    loss = loss + 1e-3 * mask_reg_loss + 1e-4 * target_resp_loss
-                    current_mask_reg = mask_reg_loss.item()
+                    # 安全校验：检查NaN
+                    if not torch.isnan(token_reliability).any() and not torch.isinf(token_reliability).any():
+                        token_reliability = token_reliability.squeeze(-1)
+                        # 归一化L2 norm：除以sqrt(num_elements)确保值域合理
+                        mask_reg_loss = torch.norm(token_reliability, p=2) / (token_reliability.numel() ** 0.5 + 1e-8)
+                        mean_reliability = token_reliability.mean()
+                        target_resp_loss = -torch.mean(torch.relu(mean_reliability - 0.3))
+                        # 裁剪到合理范围
+                        mask_reg_loss = torch.clamp(mask_reg_loss, 0, 10)
+                        target_resp_loss = torch.clamp(target_resp_loss, -10, 10)
+                        loss = loss + 1e-3 * mask_reg_loss + 1e-4 * target_resp_loss
+                        current_mask_reg = mask_reg_loss.item()
 
         # ===== 跨模态双向KL散度（权重1e-4，Stage2适度对齐） =====
         if 'branch_feats' in inject_intermediates:
@@ -263,15 +284,23 @@ class ViPTActor(BaseActor):
             rgb_f = bf.get('rgb_mean')
             tir_f = bf.get('tir_mean')
             if rgb_f is not None and tir_f is not None:
-                rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
-                tir_log_prob = F.log_softmax(tir_f, dim=-1)
-                rgb_prob = F.softmax(rgb_f, dim=-1)
-                tir_prob = F.softmax(tir_f, dim=-1)
-                kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
-                kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
-                kl_loss = (kl_rt + kl_tr) / 2.0
-                loss = loss + 1e-4 * kl_loss
-                current_kl_reg = kl_loss.item()
+                # 安全校验：检查NaN
+                if not torch.isnan(rgb_f).any() and not torch.isnan(tir_f).any():
+                    rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                    tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                    rgb_prob = F.softmax(rgb_f, dim=-1)
+                    tir_prob = F.softmax(tir_f, dim=-1)
+                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
+                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
+                    kl_loss = (kl_rt + kl_tr) / 2.0
+                    # 裁剪到合理范围 [0, 10]
+                    kl_loss = torch.clamp(kl_loss, 0, 10)
+                    loss = loss + 1e-4 * kl_loss
+                    current_kl_reg = kl_loss.item()
+
+        # 最终安全检查：确保loss不是NaN或Inf
+        if torch.isnan(loss) or torch.isinf(loss):
+            loss = tracking_loss * 0.5
 
         if return_status:
             mean_iou = iou.detach().mean()

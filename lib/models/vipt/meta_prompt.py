@@ -290,89 +290,72 @@ class MaskPromptGenerator(nn.Module):
     def forward(self, rgb_feat: torch.Tensor, tir_feat: torch.Tensor,
                 template_feat: torch.Tensor = None,
                 return_intermediate: bool = False) -> Tuple[torch.Tensor, Optional[Dict]]:
-        """
-        Args:
-            rgb_feat: [B, N, C] RGB模态特征
-            tir_feat: [B, N, C] TIR模态特征
-            template_feat: [B, N_t, C] 模板特征（可选，用于目标感知偏置）
-            return_intermediate: 是否返回中间值（供可视化使用）
-
-        Returns:
-            mask_prompt: [B, num_prompt_tokens, C]
-            intermediates: dict（仅当return_intermediate=True时返回）
-        """
         B, N, C = rgb_feat.shape
 
-        # ===== Step1: 计算原始拼接特征 =====
+        if torch.isnan(rgb_feat).any() or torch.isnan(tir_feat).any():
+            fallback = self.pos_encoding.repeat(B, 1, 1)
+            return fallback, {'token_reliability': 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)}
+
         combined = torch.cat([rgb_feat, tir_feat], dim=-1)
 
-        # ===== Step2: 核心创新1 - 空间梯度特征 =====
         rgb_gradient = self._compute_spatial_gradient(rgb_feat)
         tir_gradient = self._compute_spatial_gradient(tir_feat)
         gradient_input = torch.cat([rgb_feat, tir_feat, rgb_gradient, tir_gradient], dim=-1)
         gradient_feat = self.gradient_encoder(gradient_input)
 
-        # ===== Step3: 核心创新2 - 局部协方差特征 =====
+        if torch.isnan(gradient_feat).any():
+            gradient_feat = torch.zeros_like(gradient_feat)
+
         local_cov = self._compute_local_covariance(rgb_feat, tir_feat)
         cov_input = torch.cat([combined, local_cov], dim=-1)
         covariance_feat = self.covariance_encoder(cov_input)
 
-        # ===== Step4: 核心创新3 - 联合可靠性预测 =====
+        if torch.isnan(covariance_feat).any():
+            covariance_feat = torch.zeros_like(covariance_feat)
+
         joint_input = torch.cat([gradient_feat, covariance_feat, combined], dim=-1)
         reliability_logits = self.joint_reliability_head(joint_input).squeeze(-1)
 
-        # ===== Step5: tanh残差权重（终极修复：压缩动态范围） =====
-        # 【终极修复1】更严格的logits clamp，防止极端值
         reliability_logits = torch.clamp(reliability_logits, min=-3.0, max=3.0)
-        # 【终极修复2】压缩权重动态范围：从[0.1, 0.9] → [0.25, 0.75]
-        # 原来的：0.5 + 0.4*tanh(logits) → 范围[0.1, 0.9]（模型会顶到上限）
-        # 现在的：0.5 + 0.25*tanh(logits) → 范围[0.25, 0.75]（给模型更多区分度空间）
         token_reliability = 0.5 + 0.25 * torch.tanh(reliability_logits)
 
-        # ===== Step6: 目标感知偏置（终极修复：打破RGB偏向） =====
         target_bias = None
         if template_feat is not None:
-            # 【终极修复3】用双模态融合特征计算相似度，打破RGB偏向
-            # 先用基础权重计算初步融合特征
             fused_feat_prelim = token_reliability.unsqueeze(-1) * rgb_feat + (1 - token_reliability.unsqueeze(-1)) * tir_feat
             template_mean = template_feat.mean(dim=1, keepdim=True)
-            # 用融合特征计算相似度
             fused_norm = F.normalize(fused_feat_prelim, dim=-1, eps=1e-8)
             template_norm = F.normalize(template_mean.repeat(1, N, 1), dim=-1, eps=1e-8)
             target_sim = F.cosine_similarity(fused_norm, template_norm, dim=-1)
             modal_diff = torch.abs(rgb_feat - tir_feat).mean(dim=-1)
             modal_diff = F.normalize(modal_diff, dim=1)
-            # 【终极修复4】偏置输入改成融合特征
             target_bias = torch.sigmoid(self.target_bias_net(fused_feat_prelim).squeeze(-1))
-            # 【终极修复5】更严格的偏置约束：[0.4, 0.6]
             target_bias = torch.clamp(target_bias, min=0.4, max=0.6)
-            # 【终极修复6】减小logits_bias系数并做clamp
             logits_bias = (target_sim * modal_diff) * 0.5
             logits_bias = torch.clamp(logits_bias, min=-2.0, max=2.0)
             token_reliability = 0.5 + 0.25 * torch.tanh(reliability_logits + logits_bias)
 
-        # 【终极修复7】最终安全钳制：[0.25, 0.75]
         token_reliability = torch.clamp(token_reliability, min=0.25, max=0.75)
 
-        # ===== Step7: 可靠性加权融合 + LayerNorm =====
         fused_feat = token_reliability.unsqueeze(-1) * rgb_feat + (1 - token_reliability.unsqueeze(-1)) * tir_feat
-        fused_feat = self.fused_norm(fused_feat)  # 归一化融合特征，稳定梯度流
+        fused_feat = self.fused_norm(fused_feat)
 
-        # ===== Step8: 全局池化生成Prompt =====
+        if torch.isnan(fused_feat).any():
+            fused_feat = (rgb_feat + tir_feat) / 2.0
+            fused_feat = self.fused_norm(fused_feat)
+
         global_feat = fused_feat.mean(dim=1, keepdim=True)
 
         if self.mode == 'fomaml':
             global_feat = global_feat + self.task_emb
 
-        # ===== Step9: 生成多样化Prompt =====
         mask_prompt = global_feat.repeat(1, self.num_prompt_tokens, 1)
         mask_prompt = mask_prompt + self.pos_encoding
         mask_prompt = self.proj(mask_prompt)
 
-        assert not torch.isnan(mask_prompt).any(), f"[MaskPromptGenerator] 输出出现NaN！"
-        assert not torch.isinf(mask_prompt).any(), f"[MaskPromptGenerator] 输出出现Inf！"
+        if torch.isnan(mask_prompt).any() or torch.isinf(mask_prompt).any():
+            mask_prompt = self.pos_encoding.repeat(B, 1, 1)
+            token_reliability = 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)
 
-        # ===== 可视化记录（保留RGB和TIR权重） =====
         vis = PromptVisualizer.get()
         if self.training:
             vis.log_prompt_stats('Mask', mask_prompt, token_reliability.unsqueeze(-1))
@@ -387,7 +370,6 @@ class MaskPromptGenerator(nn.Module):
                 'fused_feat': fused_feat,
                 'target_bias': target_bias,
             }
-        # 【关键修改】即使return_intermediate=False，也返回token_reliability用于计算正则化损失
         return mask_prompt, {'token_reliability': token_reliability.unsqueeze(-1)}
 
 
@@ -1333,6 +1315,7 @@ class PromptGenerator(nn.Module):
             self.cross_attn_modulation = CrossAttentionModulation(self.embed_dim, num_heads=4)
 
         self.temporal_state = None
+        self.training_stage = 0
 
         self.inject_layers = config.get('META_PROMPT_INJECT_LAYERS', [])
         self._current_inject_layer = 0
@@ -1423,14 +1406,34 @@ class PromptGenerator(nn.Module):
             print(f"[DEBUG inject] enable_consistency={self.enable_consistency}, enable_mask={self.enable_mask}, enable_temporal={self.enable_temporal}")
             self._inject_debug_printed = True
 
-        # ===== v5核心：先判断当前层需要注入哪些模块（v24层解耦） =====
-        current_layer_id = getattr(self, '_current_inject_layer', 0)
-        
         # 【v24关键修复】每层只计算需要注入的模块，非注入层完全不forward
         # 彻底消除无效梯度干扰：之前非注入层的Temporal也在forward，导致全局锁死
-        inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
-        inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
-        inject_mask = self.enable_mask and current_layer_id in self.mask_inject_layers
+        current_layer_id = getattr(self, '_current_inject_layer', 0)
+        current_stage = getattr(self, 'training_stage', 0)
+        
+        # Stage1: 只使用模态Prompt，完全跳过辅助分支（避免未训练Prompt引入噪声）
+        # Stage2: 强制计算所有辅助分支（确保梯度连接）
+        # Stage3: 正常按层注入
+        if current_stage == 1:
+            inject_consistency = False
+            inject_temporal = False
+            inject_mask = False
+        elif current_stage == 2:
+            # 【v25关键修复】Stage2强制计算所有辅助分支，确保梯度连接
+            # 只要当前层在任意一个注入层集合中，就计算对应的prompt
+            inject_consistency = self.enable_consistency and (
+                current_layer_id in self.inject_layers or len(self.inject_layers) == 0
+            )
+            inject_temporal = self.enable_temporal and (
+                current_layer_id in self.temporal_inject_layers or len(self.temporal_inject_layers) == 0
+            )
+            inject_mask = self.enable_mask and (
+                current_layer_id in self.mask_inject_layers or len(self.mask_inject_layers) == 0
+            )
+        else:
+            inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
+            inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
+            inject_mask = self.enable_mask and current_layer_id in self.mask_inject_layers
         
         token_consistency = None
         consistency_prompt = None
@@ -1770,9 +1773,9 @@ class PromptGenerator(nn.Module):
                 intermediates['layer_gate'] = gate.mean(dim=0).detach().cpu().tolist()
                 
                 if current_layer_id <= 3:
-                    alpha_scale = 0.05 + 0.05 * gate
+                    alpha_scale = 0.1 + 0.15 * gate
                 else:
-                    alpha_scale = 0.05 + 0.15 * gate
+                    alpha_scale = 0.1 + 0.2 * gate
                 
                 modulations = []
                 

@@ -100,9 +100,9 @@ def update_optimizer_for_stage(optimizer, net, stage, cfg):
     if stage == 1:
         group = default_group.copy()
         group['params'] = [p for n, p in net.named_parameters() if p.requires_grad]
-        group['lr'] = base_lr * 0.5
+        group['lr'] = base_lr * 1.5
         new_param_groups.append(group)
-        print(f"[Stage1优化器] LR={base_lr*0.5:.2e}")
+        print(f"[Stage1优化器] LR={base_lr*1.5:.2e} (Prompt需要较高LR)")
     
     elif stage == 2:
         group = default_group.copy()
@@ -166,12 +166,22 @@ def save_full_checkpoint(net, optimizer, lr_scheduler, epoch, best_iou, stage, s
 
 
 def run_single_stage(stage_num, net, optimizer, lr_scheduler, trainer, settings, cfg,
-                     epochs, best_iou, stage_ckpt_path):
+                     epochs, best_iou, stage_ckpt_path, global_epoch_offset=0):
     print(f"\n{'='*70}")
     print(f"  Stage {stage_num} 开始训练 ({epochs} epochs)")
     print(f"{'='*70}")
     
     cfg.TRAIN.STAGE = stage_num
+    
+    # 设置当前训练阶段到meta_prompt_generator（用于控制inject行为）
+    if hasattr(net, 'module'):
+        meta_prompt = net.module.backbone.meta_prompt_generator
+    else:
+        meta_prompt = net.backbone.meta_prompt_generator
+    if hasattr(meta_prompt, 'training_stage'):
+        meta_prompt.training_stage = stage_num
+        print(f"[Stage{stage_num}] 已设置 training_stage={stage_num}")
+    
     apply_stage_freeze(net, stage_num)
     update_optimizer_for_stage(optimizer, net, stage_num, cfg)
     
@@ -180,7 +190,9 @@ def run_single_stage(stage_num, net, optimizer, lr_scheduler, trainer, settings,
     early_stop_warmup = 5
     
     for epoch in range(1, epochs + 1):
-        trainer.epoch = epoch
+        # 使用全局epoch作为tensorboard的step（确保曲线连续）
+        global_epoch = global_epoch_offset + epoch
+        trainer.epoch = global_epoch
         trainer.train_epoch()
         
         if lr_scheduler is not None:
@@ -319,8 +331,12 @@ def main():
         best_iou = run_single_stage(
             stage_num=1, net=net, optimizer=optimizer, lr_scheduler=lr_scheduler,
             trainer=trainer, settings=settings, cfg=cfg,
-            epochs=args.stage1_epochs, best_iou=best_iou, stage_ckpt_path=stage1_ckpt
+            epochs=args.stage1_epochs, best_iou=best_iou, stage_ckpt_path=stage1_ckpt,
+            global_epoch_offset=0
         )
+        
+        # Stage1完成后，全局epoch偏移量为stage1_epochs
+        stage1_done_epochs = args.stage1_epochs
         
         print("\n" + "=" * 70)
         print("                    Stage 2: 辅助分支训练")
@@ -350,8 +366,12 @@ def main():
         best_iou = run_single_stage(
             stage_num=2, net=net, optimizer=optimizer, lr_scheduler=lr_scheduler,
             trainer=trainer, settings=settings, cfg=cfg,
-            epochs=args.stage2_epochs, best_iou=best_iou, stage_ckpt_path=stage2_ckpt
+            epochs=args.stage2_epochs, best_iou=best_iou, stage_ckpt_path=stage2_ckpt,
+            global_epoch_offset=stage1_done_epochs
         )
+        
+        # Stage2完成后，全局epoch偏移量累加
+        stage2_done_epochs = stage1_done_epochs + args.stage2_epochs
         
         print("\n" + "=" * 70)
         print("                    Stage 3: 联合微调")
@@ -361,7 +381,8 @@ def main():
         best_iou = run_single_stage(
             stage_num=3, net=net, optimizer=optimizer, lr_scheduler=lr_scheduler,
             trainer=trainer, settings=settings, cfg=cfg,
-            epochs=args.stage3_epochs, best_iou=best_iou, stage_ckpt_path=stage3_ckpt
+            epochs=args.stage3_epochs, best_iou=best_iou, stage_ckpt_path=stage3_ckpt,
+            global_epoch_offset=stage2_done_epochs
         )
         
         total_elapsed = time.time() - total_start
