@@ -1,4 +1,5 @@
 import pdb
+import torch.nn.functional as F
 
 from . import BaseActor
 from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy
@@ -27,7 +28,7 @@ class ViPTActor(BaseActor):
             self._apply_freeze_settings()
     
     def _apply_freeze_settings(self):
-        """【v20】根据STAGE配置冻结指定模块"""
+        """三阶段训练：Stage1模态专属→Stage2一致性+时序→Stage3联合微调"""
         net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
         
         stage = getattr(self.cfg.TRAIN, 'STAGE', 0)
@@ -35,34 +36,43 @@ class ViPTActor(BaseActor):
         if stage == 0:
             return
         
-        print(f"[v20分阶段训练] STAGE={stage}")
+        print(f"[三阶段训练] STAGE={stage}")
         
         if hasattr(net, 'backbone') and hasattr(net.backbone, 'meta_prompt_generator'):
             meta_gen = net.backbone.meta_prompt_generator
             
             if stage == 1:
-                # stage1：固定Consistency，只训练Temporal
+                # Stage1：仅训练模态专属Prompt（低层1-3）+ 基础跟踪头
+                # 冻结Consistency、Temporal、Mask分支
                 for name, param in net.named_parameters():
-                    if 'consistency_generator' in name:
+                    if any(kw in name for kw in ['consistency_generator', 'temporal_generator', 
+                                                   'mask_generator', 'cross_attn_modulation',
+                                                   'layer_gates', 'alpha_consistency', 
+                                                   'alpha_temporal', 'alpha_mask']):
                         param.requires_grad = False
                     else:
                         param.requires_grad = True
-                print("[v20 STAGE1] Consistency模块已冻结，Temporal模块可训练")
+                print("[STAGE1] 模态专属Prompt可训练，Consistency/Temporal/Mask已冻结")
             
             elif stage == 2:
-                # stage2：固定Temporal，只训练Consistency
+                # Stage2：冻结模态专属分支，训练Consistency+Temporal
                 for name, param in net.named_parameters():
-                    if 'temporal_generator' in name:
+                    if any(kw in name for kw in ['modality_prompt_proj', 'rgb_type_token', 'tir_type_token']):
                         param.requires_grad = False
+                    elif any(kw in name for kw in ['consistency_generator', 'temporal_generator',
+                                                    'mask_generator', 'cross_attn_modulation',
+                                                    'layer_gates', 'alpha_consistency',
+                                                    'alpha_temporal', 'alpha_mask']):
+                        param.requires_grad = True
                     else:
                         param.requires_grad = True
-                print("[v20 STAGE2] Temporal模块已冻结，Consistency模块可训练")
+                print("[STAGE2] Consistency+Temporal+Mask可训练，模态专属已冻结")
             
             elif stage == 3:
-                # stage3：放开所有参数，联合微调
+                # Stage3：解冻所有分支，联合微调
                 for param in net.parameters():
                     param.requires_grad = True
-                print("[v20 STAGE3] 所有参数已放开，联合微调")
+                print("[STAGE3] 所有参数已解冻，联合微调")
 
     def fix_bns(self):
         net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
@@ -170,11 +180,13 @@ class ViPTActor(BaseActor):
         current_reg_loss = 0.0
         current_temporal_reg = 0.0
         current_mask_reg = 0.0
+        current_ortho_reg = 0.0
+        current_kl_reg = 0.0
 
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
 
-            # ===== Consistency正则化（双峰分布约束+最小化熵） =====
+            # ===== Consistency轻量正则（L2范数约束，防止特征爆炸） =====
             if 'consistency_intermediates' in inject_intermediates:
                 consistency_data = inject_intermediates['consistency_intermediates']
                 if consistency_data is not None and isinstance(consistency_data, dict):
@@ -185,94 +197,76 @@ class ViPTActor(BaseActor):
                     if token_weight is not None:
                         weight_var = torch.var(token_weight, dim=1)
                         current_weight_var = weight_var.mean().item()
-                        B, N = token_weight.shape
-                        weight_clamped = torch.clamp(token_weight, min=0.01, max=0.99)
-                        num_bins = 20
-                        bin_indices = (weight_clamped * num_bins).long().clamp(0, num_bins - 1)
-                        batch_entropies = []
-                        for b in range(B):
-                            hist = torch.bincount(bin_indices[b], minlength=num_bins).float()
-                            hist = hist / (hist.sum() + 1e-8)
-                            hist = torch.clamp(hist, min=1e-8)
-                            entropy = -(hist * torch.log(hist)).sum()
-                            batch_entropies.append(entropy)
-                        current_weight_entropy = torch.stack(batch_entropies).mean().item()
-
-                        # 双峰分布约束：鼓励权重向0/1两端分化
-                        # p*(1-p)在p=0.5时最大，在p=0/1时为0
-                        # 最小化p*(1-p) → 鼓励权重远离0.5
-                        bimodal_reg = torch.mean(token_weight * (1 - token_weight))
-                        # 最小化熵：让权重更有区分度
-                        p = torch.clamp(token_weight, min=1e-6, max=1 - 1e-6)
-                        entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
-                        entropy_min_reg = torch.mean(entropy)
-                        consistency_reg_loss = 0.5 * bimodal_reg + 0.5 * entropy_min_reg
-                        loss = loss + 0.02 * consistency_reg_loss
+                        consistency_reg_loss = torch.norm(token_weight, p=2)
+                        loss = loss + 1e-4 * consistency_reg_loss
                         current_reg_loss = consistency_reg_loss.item()
 
-            # ===== Temporal正则化（v25五维约束） =====
-            # 【v25核心】v24解决了"约束失效"，v25解决"权重震荡+输出衰减"
-            # 曲线证据：avg_weight在0.35-0.55剧烈震荡，prompt_mean从0.03衰减到0.025
+            # ===== Temporal轻量正则（帧间平滑+L2范数） =====
             if 'temporal_intermediates' in inject_intermediates:
                 temporal_data = inject_intermediates['temporal_intermediates']
                 if temporal_data is not None and isinstance(temporal_data, dict):
                     if 'temporal_weight' in temporal_data:
                         tw = temporal_data['temporal_weight']
-                        B, N = tw.shape
-
-                        # 1. 权重均值上下限：强制[0.40, 0.58]（从0.35-0.65收紧）
-                        weight_mean = tw.mean(dim=1)
-                        lower_p = torch.mean(torch.relu(0.40 - weight_mean) ** 2)
-                        upper_p = torch.mean(torch.relu(weight_mean - 0.58) ** 2)
-                        mean_reg = lower_p + upper_p
-
-                        # 2. 熵范围压缩：从[0.25,0.65]→[0.38,0.55]，减少震荡空间
-                        entropy = -(tw * torch.log(tw + 1e-8) + (1 - tw) * torch.log(1 - tw + 1e-8))
-                        ent_lower = torch.mean(torch.relu(0.38 - entropy) ** 2)
-                        ent_upper = torch.mean(torch.relu(entropy - 0.55) ** 2)
-                        entropy_reg = ent_lower + ent_upper
-
-                        # 3. 【v25新增】帧间平滑性：惩罚相邻帧权重突变
-                        smooth_reg = torch.tensor(0.0, device=loss.device)
+                        temporal_reg_loss = torch.norm(tw, p=2) * 0.5
                         if 'prev_temporal_weight' in temporal_data and temporal_data['prev_temporal_weight'] is not None:
                             prev_tw = temporal_data['prev_temporal_weight']
                             if prev_tw.shape == tw.shape:
-                                smooth_reg = torch.mean((tw - prev_tw) ** 2)
-
-                        # 4. motion_gate下限约束（保持不变）
-                        motion_reg = torch.tensor(0.0, device=loss.device)
-                        if 'motion_gate' in temporal_data:
-                            mg = temporal_data['motion_gate'].squeeze()
-                            motion_reg = torch.mean(torch.relu(0.85 - mg) ** 2)
-
-                        # 5. 【v25新增】层间差异约束：鼓励分层学习
-                        layer_reg = torch.tensor(0.0, device=loss.device)
-                        if 'layer_divergence' in temporal_data:
-                            ld = temporal_data['layer_divergence']
-                            if isinstance(ld, torch.Tensor):
-                                layer_reg = torch.mean(torch.relu(0.05 - ld) ** 2)
-
-                        # 五维组合：平滑30% + 均值20% + 熵20% + 门控15% + 层间15%
-                        temporal_reg_loss = 0.30*smooth_reg + 0.20*mean_reg + 0.20*entropy_reg + 0.15*motion_reg + 0.15*layer_reg
-                        loss = loss + 0.02 * temporal_reg_loss
+                                temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
+                        loss = loss + 1e-4 * temporal_reg_loss
                         current_temporal_reg = temporal_reg_loss.item()
 
-            # ===== Mask正则化（双峰分布约束+最小化熵） =====
+            # ===== Mask轻量正则（L2范数约束） =====
             if 'mask_intermediates' in inject_intermediates:
                 mask_data = inject_intermediates['mask_intermediates']
                 if mask_data is not None and isinstance(mask_data, dict):
                     if 'token_reliability' in mask_data:
                         token_reliability = mask_data['token_reliability'].squeeze(-1)
-
-                        # 双峰分布约束：鼓励权重向0/1两端分化
-                        bimodal_reg = torch.mean(token_reliability * (1 - token_reliability))
-                        # 最小化熵
-                        tr = torch.clamp(token_reliability, min=1e-6, max=1 - 1e-6)
-                        entropy = -(tr * torch.log(tr) + (1 - tr) * torch.log(1 - tr))
-                        entropy_min_reg = torch.mean(entropy)
-                        mask_reg_loss = 0.5 * bimodal_reg + 0.5 * entropy_min_reg
-                        loss = loss + 0.01 * mask_reg_loss
+                        mask_reg_loss = torch.norm(token_reliability, p=2)
+                        loss = loss + 1e-4 * mask_reg_loss
                         current_mask_reg = mask_reg_loss.item()
+
+            # ===== 正交正则：强制分支特征互补无冗余 =====
+            if 'branch_feats' in inject_intermediates:
+                bf = inject_intermediates['branch_feats']
+                rgb_f = bf.get('rgb_mean')
+                tir_f = bf.get('tir_mean')
+                cons_f = bf.get('consistency_mean')
+                temp_f = bf.get('temporal_mean')
+                
+                ortho_terms = []
+                if rgb_f is not None and tir_f is not None:
+                    rgb_fn = rgb_f / (rgb_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    tir_fn = tir_f / (tir_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(rgb_fn.unsqueeze(1), tir_fn.unsqueeze(2)).squeeze(), p=2))
+                if rgb_f is not None and cons_f is not None:
+                    rgb_fn = rgb_f / (rgb_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(rgb_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+                if tir_f is not None and cons_f is not None:
+                    tir_fn = tir_f / (tir_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(tir_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+                if temp_f is not None and cons_f is not None:
+                    temp_fn = temp_f / (temp_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(temp_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+                
+                if ortho_terms:
+                    ortho_loss = sum(ortho_terms) / len(ortho_terms)
+                    loss = loss + 5e-5 * ortho_loss
+                    current_ortho_reg = ortho_loss.item()
+
+            # ===== 跨模态KL散度损失：一致性分支专属约束 =====
+            if 'branch_feats' in inject_intermediates:
+                bf = inject_intermediates['branch_feats']
+                rgb_f = bf.get('rgb_mean')
+                tir_f = bf.get('tir_mean')
+                if rgb_f is not None and tir_f is not None:
+                    rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                    tir_prob = F.softmax(tir_f, dim=-1)
+                    kl_loss = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
+                    loss = loss + 1e-4 * kl_loss
+                    current_kl_reg = kl_loss.item()
 
         if return_status:
             mean_iou = iou.detach().mean()
@@ -283,6 +277,8 @@ class ViPTActor(BaseActor):
                       "Loss/consistency_reg": current_reg_loss,
                       "Loss/temporal_reg": current_temporal_reg,
                       "Loss/mask_reg": current_mask_reg,
+                      "Loss/ortho_reg": current_ortho_reg,
+                      "Loss/kl_reg": current_kl_reg,
                       "Train/weight_var": current_weight_var if current_weight_var else 0.0,
                       "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
                       "IoU": mean_iou.item()}

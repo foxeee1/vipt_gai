@@ -100,7 +100,7 @@ class VisionTransformerCE(VisionTransformer):
                  base_prompt_inject_layers=None, meta_prompt_inject_layers=None,
                  meta_enable_mask=True, meta_enable_temporal=True, meta_enable_consistency=True,
                  coop_strategy='temporal_modulate', temporal_prompt_inject_layers=None,
-                 mask_prompt_inject_layers=None):
+                 mask_prompt_inject_layers=None, modality_prompt_inject_layers=None):
         super().__init__()
 
         if isinstance(img_size, tuple):
@@ -212,6 +212,7 @@ class VisionTransformerCE(VisionTransformer):
                     'META_PROMPT_INJECT_LAYERS': meta_prompt_inject_layers if meta_prompt_inject_layers else [],
                     'TEMPORAL_PROMPT_INJECT_LAYERS': temporal_prompt_inject_layers if temporal_prompt_inject_layers else meta_prompt_inject_layers if meta_prompt_inject_layers else [],
                     'MASK_PROMPT_INJECT_LAYERS': mask_prompt_inject_layers if mask_prompt_inject_layers else meta_prompt_inject_layers if meta_prompt_inject_layers else [],
+                    'MODALITY_PROMPT_INJECT_LAYERS': modality_prompt_inject_layers if modality_prompt_inject_layers else [1, 2, 3],
                 }
             )
             self.prev_features = None
@@ -437,6 +438,15 @@ class VisionTransformerCE(VisionTransformer):
         z_dte = self.patch_embed_prompt(z_dte)
         x_dte = self.patch_embed_prompt(x_dte)
 
+        if hasattr(self, 'meta_prompt_generator') and self.meta_prompt_generator is not None:
+            B_cur = z.shape[0]
+            rgb_type = self.meta_prompt_generator.rgb_type_token.expand(B_cur, -1, -1)
+            tir_type = self.meta_prompt_generator.tir_type_token.expand(B_cur, -1, -1)
+            z = z + 0.05 * rgb_type
+            x = x + 0.05 * rgb_type
+            z_dte = z_dte + 0.05 * tir_type
+            x_dte = x_dte + 0.05 * tir_type
+
         if len(self.base_prompt_inject_layers) > 0:
             if 0 in self.base_prompt_inject_layers:
                 z_feat = token2feature(self.prompt_norms[0](z))
@@ -602,11 +612,12 @@ class VisionTransformerCE(VisionTransformer):
                     dim=1, index=global_index_s_safe.unsqueeze(-1).expand(B, -1, C).to(torch.int64))
                 x_rgb_search_cur = x_rgb_search_cur + 0.1 * rgb_dte_diff
                 x_dte_search_cur = x_dte_search_cur - 0.1 * rgb_dte_diff
-                x_rgb_search_modulated, inject_intermediates = self.meta_prompt_generator.inject(
+                x_rgb_search_modulated, layer_intermediates = self.meta_prompt_generator.inject(
                     x_rgb_search_cur, x_dte_search_cur, x_rgb_search,
                     prev_features=self.prev_features,
                     consistency_version=getattr(self, 'consistency_version', 'gradient')
                 )
+                inject_intermediates.update(layer_intermediates)
                 # 【避免原地操作】用torch.cat重新拼接z和调制后的search，避免梯度断裂
                 x_z = x[:, :lens_z_new, :]
                 x = torch.cat([x_z, x_rgb_search_modulated], dim=1)
@@ -614,7 +625,8 @@ class VisionTransformerCE(VisionTransformer):
             if self.ce_loc is not None and i in self.ce_loc:
                 removed_indexes_s.append(removed_index_s)
 
-            self.prev_features = x
+        # 仅在帧末保存完整输出特征，供下一帧Temporal模块使用
+        self.prev_features = x.detach()
 
         x = self.norm(x)
 

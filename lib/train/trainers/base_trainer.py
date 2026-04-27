@@ -28,6 +28,10 @@ class BaseTrainer:
         self.update_settings(settings)
 
         self.epoch = 0
+        self._best_val_metric = None
+        self._patience_counter = 0
+        self._early_stop_patience = getattr(settings, 'early_stop_patience', 0)
+        self._early_stop_warmup = getattr(settings, 'early_stop_warmup', 5)
         self.stats = {}
 
         self.device = getattr(settings, 'device', None)
@@ -85,6 +89,13 @@ class BaseTrainer:
 
                     self.train_epoch()
 
+                    if self._early_stop_patience > 0 and self._check_early_stop():
+                        print(f'[早停] 连续{self._early_stop_patience}个epoch验证指标未提升，提前停止训练')
+                        if self._checkpoint_dir:
+                            if self.settings.local_rank in [-1, 0]:
+                                self.save_checkpoint()
+                        break
+
                     if self.lr_scheduler is not None:
                         if self.settings.scheduler_type != 'cosine':
                             self.lr_scheduler.step()
@@ -112,6 +123,46 @@ class BaseTrainer:
 
     def train_epoch(self):
         raise NotImplementedError
+
+    def _check_early_stop(self):
+        """检查是否应该早停：基于验证集IoU指标"""
+        if self.epoch <= self._early_stop_warmup:
+            return False
+
+        val_key = None
+        for loader_name in self.stats:
+            if 'val' in loader_name.lower():
+                val_key = loader_name
+                break
+        
+        if val_key is None or self.stats[val_key] is None:
+            return False
+        
+        current_metric = None
+        for metric_name in ['IoU', 'Loss/total']:
+            if metric_name in self.stats[val_key]:
+                current_metric = self.stats[val_key][metric_name].avg
+                break
+        
+        if current_metric is None:
+            return False
+        
+        is_loss = 'Loss' in metric_name if current_metric is not None else False
+        
+        if self._best_val_metric is None:
+            self._best_val_metric = current_metric
+            self._patience_counter = 0
+            return False
+        
+        improved = (current_metric < self._best_val_metric) if is_loss else (current_metric > self._best_val_metric)
+        
+        if improved:
+            self._best_val_metric = current_metric
+            self._patience_counter = 0
+            return False
+        else:
+            self._patience_counter += 1
+            return self._patience_counter >= self._early_stop_patience
 
     def save_checkpoint(self):
         """Saves a checkpoint of the network and other variables."""

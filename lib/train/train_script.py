@@ -264,7 +264,8 @@ def run(settings):
     # 保存最近N个epoch的checkpoint
     settings.save_last_n_epoch = getattr(cfg.TRAIN, "SAVE_LAST_N_EPOCH", 1)
 
-    # 【关键】将cfg添加到settings，供trainer访问可视化配置
+    settings.early_stop_patience = getattr(cfg.TRAIN, "EARLY_STOP_PATIENCE", 0)
+
     settings.cfg = cfg
 
     # ==================== 第十二步：创建训练器 ====================

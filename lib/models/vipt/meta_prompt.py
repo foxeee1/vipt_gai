@@ -1331,8 +1331,8 @@ class PromptGenerator(nn.Module):
         
         self.mask_inject_layers = config.get('MASK_PROMPT_INJECT_LAYERS', self.inject_layers)
         
-        # 【v22新增】并行独立注入的全局强度系数
-        # 每个提示独立的门控，初始化为单提示的性能比例
+        self.modality_inject_layers = config.get('MODALITY_PROMPT_INJECT_LAYERS', [1, 2, 3])
+        
         if self.enable_consistency:
             self.alpha_consistency = nn.Parameter(torch.tensor(0.1))
         if self.enable_temporal:
@@ -1340,19 +1340,26 @@ class PromptGenerator(nn.Module):
         if self.enable_mask:
             self.alpha_mask = nn.Parameter(torch.tensor(0.05))
         
-        # 【v22核心】CVPR 2025层门控（Layer-wise Gating）
-        # 每层学习独立的门控，控制每个提示在该层的注入强度
-        # 门控由该层的原始特征动态生成，完全自适应
+        self.rgb_type_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
+        self.tir_type_token = nn.Parameter(torch.randn(1, 1, self.embed_dim) * 0.02)
+        
+        self.modality_prompt_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.embed_dim)
+        )
+        
         self.layer_gates = nn.ModuleDict()
-        all_inject_layers = set(self.inject_layers) | set(self.temporal_inject_layers) | set(self.mask_inject_layers)
+        all_inject_layers = set(self.inject_layers) | set(self.temporal_inject_layers) | set(self.mask_inject_layers) | set(self.modality_inject_layers)
         for layer_id in all_inject_layers:
+            num_gates = 4
             self.layer_gates[str(layer_id)] = nn.Sequential(
                 nn.Linear(self.embed_dim * 2, self.embed_dim // 4),
                 nn.GELU(),
-                nn.Linear(self.embed_dim // 4, 3)
+                nn.Linear(self.embed_dim // 4, num_gates)
             )
             with torch.no_grad():
-                self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0])
+                self.layer_gates[str(layer_id)][-1].bias.data.zero_()
 
     @property
     def total_prompt_len(self):
@@ -1738,50 +1745,64 @@ class PromptGenerator(nn.Module):
         if self.coop_strategy == 'layer_gating':
             current_layer_id = getattr(self, '_current_inject_layer', 0)
             
-            # 检查当前层是否有门控
             if str(current_layer_id) in self.layer_gates:
-                # 由该层原始特征动态生成门控
                 gate_input = torch.cat([rgb_feat.mean(dim=1), tir_feat.mean(dim=1)], dim=-1)
                 gate_logits = self.layer_gates[str(current_layer_id)](gate_input)
-                gate = F.softmax(gate_logits, dim=-1)  # [B, 3]
+                gate = torch.sigmoid(gate_logits)  # [B, 4] 独立门控
                 
                 intermediates['layer_gate'] = gate.mean(dim=0).detach().cpu().tolist()
                 
-                gate = torch.clamp(gate, min=0.1, max=0.8)
-                gate = gate / gate.sum(dim=-1, keepdim=True)
+                if current_layer_id <= 3:
+                    alpha_scale = 0.05 + 0.05 * gate
+                else:
+                    alpha_scale = 0.05 + 0.15 * gate
                 
                 modulations = []
                 
-                # 1. Consistency调制（基于原始x_search）
+                # 0. 模态专属Prompt（低层1-3）
+                if current_layer_id in self.modality_inject_layers:
+                    rgb_mod = self.modality_prompt_proj(rgb_feat.mean(dim=1, keepdim=True))
+                    tir_mod = self.modality_prompt_proj(tir_feat.mean(dim=1, keepdim=True))
+                    modality_mod = rgb_mod + tir_mod
+                    modulations.append(('modality', 0, modality_mod))
+                
+                # 1. Consistency调制（中层5-6）
                 if consistency_prompt is not None and current_layer_id in self.inject_layers:
                     if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
                         consistency_mod = self.cross_attn_modulation(consistency_prompt, x_search)
                     else:
                         consistency_mod = consistency_prompt.mean(dim=1, keepdim=True)
-                    modulations.append(('consistency', 0, consistency_mod))
+                    modulations.append(('consistency', 1, consistency_mod))
                 
-                # 2. Temporal调制（基于原始x_search，不是被修改后的！）
+                # 2. Temporal调制（高层8-9）
                 if temporal_prompt is not None and current_layer_id in self.temporal_inject_layers:
                     if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
                         temporal_mod = self.cross_attn_modulation(temporal_prompt, x_search)
                     else:
                         temporal_mod = temporal_prompt.mean(dim=1, keepdim=True)
-                    modulations.append(('temporal', 1, temporal_mod))
+                    modulations.append(('temporal', 2, temporal_mod))
                 
-                # 3. Mask调制（基于原始x_search）
+                # 3. Mask调制（最高层9）
                 if mask_prompt is not None and current_layer_id in self.mask_inject_layers:
                     if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
                         mask_mod = self.cross_attn_modulation(mask_prompt, x_search)
                     else:
                         mask_mod = mask_prompt.mean(dim=1, keepdim=True)
-                    modulations.append(('mask', 2, mask_mod))
+                    modulations.append(('mask', 3, mask_mod))
                 
                 total_modulation = torch.zeros_like(x_search)
                 for name, idx, modulation in modulations:
-                    effective_gate = gate[:, idx:idx+1].unsqueeze(-1)
+                    effective_gate = alpha_scale[:, idx:idx+1].unsqueeze(-1)
                     total_modulation = total_modulation + effective_gate * modulation
                 
                 x_search = x_search + total_modulation
+                
+                intermediates['branch_feats'] = {
+                    'rgb_mean': rgb_feat.mean(dim=1).detach(),
+                    'tir_mean': tir_feat.mean(dim=1).detach(),
+                    'consistency_mean': consistency_prompt.mean(dim=1).detach() if consistency_prompt is not None else None,
+                    'temporal_mean': temporal_prompt.mean(dim=1).detach() if temporal_prompt is not None else None,
+                }
             
             return x_search, intermediates
 
