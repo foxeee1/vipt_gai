@@ -186,19 +186,21 @@ class ViPTActor(BaseActor):
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
 
-            # ===== Consistency轻量正则（L2范数约束，防止特征爆炸） =====
+            # ===== Consistency轻量正则（L2范数约束，归一化到token数量） =====
             if 'consistency_intermediates' in inject_intermediates:
                 consistency_data = inject_intermediates['consistency_intermediates']
                 if consistency_data is not None and isinstance(consistency_data, dict):
                     token_weight = None
                     if 'token_consistency' in consistency_data:
                         token_weight = consistency_data['token_consistency'].squeeze(-1)
-                    
+
                     if token_weight is not None:
                         weight_var = torch.var(token_weight, dim=1)
                         current_weight_var = weight_var.mean().item()
-                        consistency_reg_loss = torch.norm(token_weight, p=2)
-                        loss = loss + 1e-4 * consistency_reg_loss
+                        # 【v25修复】除以token数量归一化，避免token数多导致reg爆炸
+                        num_tokens = max(token_weight.shape[1], 1)
+                        consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
+                        loss = loss + 1e-6 * consistency_reg_loss
                         current_reg_loss = consistency_reg_loss.item()
 
             # ===== Temporal轻量正则（帧间平滑+L2范数） =====
@@ -212,7 +214,8 @@ class ViPTActor(BaseActor):
                             prev_tw = temporal_data['prev_temporal_weight']
                             if prev_tw.shape == tw.shape:
                                 temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
-                        loss = loss + 1e-4 * temporal_reg_loss
+                        # 【v25修复】权重从1e-4降到1e-6
+                        loss = loss + 1e-6 * temporal_reg_loss
                         current_temporal_reg = temporal_reg_loss.item()
 
             # ===== Mask轻量正则（L2范数约束） =====
@@ -222,17 +225,18 @@ class ViPTActor(BaseActor):
                     if 'token_reliability' in mask_data:
                         token_reliability = mask_data['token_reliability'].squeeze(-1)
                         mask_reg_loss = torch.norm(token_reliability, p=2)
-                        loss = loss + 1e-4 * mask_reg_loss
+                        # 【v25修复】权重从1e-4降到1e-6
+                        loss = loss + 1e-6 * mask_reg_loss
                         current_mask_reg = mask_reg_loss.item()
 
-            # ===== 正交正则：强制分支特征互补无冗余 =====
+            # ===== 正交正则：强制分支特征互补无冗余（权重大幅降低） =====
             if 'branch_feats' in inject_intermediates:
                 bf = inject_intermediates['branch_feats']
                 rgb_f = bf.get('rgb_mean')
                 tir_f = bf.get('tir_mean')
                 cons_f = bf.get('consistency_mean')
                 temp_f = bf.get('temporal_mean')
-                
+
                 ortho_terms = []
                 if rgb_f is not None and tir_f is not None:
                     rgb_fn = rgb_f / (rgb_f.norm(dim=-1, keepdim=True) + 1e-8)
@@ -250,22 +254,29 @@ class ViPTActor(BaseActor):
                     temp_fn = temp_f / (temp_f.norm(dim=-1, keepdim=True) + 1e-8)
                     cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
                     ortho_terms.append(torch.norm(torch.bmm(temp_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
-                
+
                 if ortho_terms:
                     ortho_loss = sum(ortho_terms) / len(ortho_terms)
-                    loss = loss + 5e-5 * ortho_loss
+                    # 【v25修复】权重从5e-5降到5e-7，防止反客为主
+                    loss = loss + 5e-7 * ortho_loss
                     current_ortho_reg = ortho_loss.item()
 
-            # ===== 跨模态KL散度损失：一致性分支专属约束 =====
+            # ===== 跨模态KL散度损失：双向对称，防止单向对齐导致分支消失 =====
             if 'branch_feats' in inject_intermediates:
                 bf = inject_intermediates['branch_feats']
                 rgb_f = bf.get('rgb_mean')
                 tir_f = bf.get('tir_mean')
                 if rgb_f is not None and tir_f is not None:
+                    # 【v25修复】双向对称KL散度，避免单向对齐导致一个分支消失
                     rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                    tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                    rgb_prob = F.softmax(rgb_f, dim=-1)
                     tir_prob = F.softmax(tir_f, dim=-1)
-                    kl_loss = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
-                    loss = loss + 1e-4 * kl_loss
+                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
+                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
+                    kl_loss = (kl_rt + kl_tr) / 2.0
+                    # 【v25修复】权重从1e-4降到1e-6
+                    loss = loss + 1e-6 * kl_loss
                     current_kl_reg = kl_loss.item()
 
         if return_status:

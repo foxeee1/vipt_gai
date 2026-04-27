@@ -76,6 +76,14 @@ def run_stage(stage_num, stage_name, epochs, inject_layers, prev_stage_ckpt=None
     stage_config['TRAIN']['STAGE'] = stage_num
     stage_config['TRAIN']['EPOCH'] = epochs
 
+    # 【v25修复】Stage1/2禁止早停（必须跑满分配的epoch），Stage3才允许早停
+    if stage_num in [1, 2]:
+        stage_config['TRAIN']['EARLY_STOP_PATIENCE'] = 0
+        print(f"  [早停] 已禁用（Stage{stage_num}必须跑满{epochs}轮）")
+    else:
+        stage_config['TRAIN']['EARLY_STOP_PATIENCE'] = base_config.get('TRAIN', {}).get('EARLY_STOP_PATIENCE', 5)
+        print(f"  [早停] 已启用（耐心值={stage_config['TRAIN']['EARLY_STOP_PATIENCE']}）")
+
     stage_config['MODEL']['BACKBONE']['META_PROMPT_INJECT_LAYERS'] = inject_layers.get('consistency', [5, 6])
     stage_config['MODEL']['BACKBONE']['TEMPORAL_PROMPT_INJECT_LAYERS'] = inject_layers.get('temporal', [8, 9])
     stage_config['MODEL']['BACKBONE']['MASK_PROMPT_INJECT_LAYERS'] = inject_layers.get('mask', [9])

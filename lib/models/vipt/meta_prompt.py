@@ -1359,7 +1359,14 @@ class PromptGenerator(nn.Module):
                 nn.Linear(self.embed_dim // 4, num_gates)
             )
             with torch.no_grad():
-                self.layer_gates[str(layer_id)][-1].bias.data.zero_()
+                if layer_id in [1, 2, 3]:
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.5, 0.5, -1.0, -1.0])
+                elif layer_id in [5, 6]:
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, 0.8, -1.0])
+                elif layer_id in [8, 9]:
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, -0.5, 0.8])
+                else:
+                    self.layer_gates[str(layer_id)][-1].bias.data.zero_()
 
     @property
     def total_prompt_len(self):

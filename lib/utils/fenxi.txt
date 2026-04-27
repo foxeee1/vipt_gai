@@ -1,127 +1,235 @@
-# 2024-2025顶会多Prompt注入主流方案：与你的实现对比+可参考优化点
-结合CVPR/ICCV/ICML/TPAMI等CCF A类顶会的最新工作（2024-2025），我从**注入位置、注入强度、协同策略、门控机制**四大核心维度，拆解主流设计逻辑，对比你的实现缺陷，并给出可直接落地的参考方案，彻底解决你三提示协同精度不如单/双提示的问题。
+# 核心结论先给你说死
+你的三阶段训练性能和基线持平、每个阶段早停，**根本不是三阶段思路或多Prompt架构的问题，是4个致命的代码逻辑错误+超参错配，直接让三分支退化为单TIR分支，RGB/一致性/时序分支完全躺平失效**——相当于你训了个单模态TIR基线，性能当然和原生ViPT持平，甚至更差。
+
+所有问题都有你Tensorboard曲线的铁证，我会对应到代码细节，给你可直接落地的修复方案。
 
 ---
 
-## 一、注入位置：顶会主流方案 vs 你的实现
-### 顶会核心共识：分层分职责稀疏注入，完全解耦无竞争
-近两年顶会工作彻底抛弃了「全层注入/重叠注入」的设计，核心逻辑是**匹配ViT的特征学习规律，给不同Prompt分配专属的、无重叠的注入层，严格分工，避免分支竞争**：
-| 顶会方案 | 注入位置设计 | 核心逻辑 |
-|----------|--------------|----------|
-| CVPR2024 Un-Track | 模态专属Prompt→ViT前3层（低层）；共享对齐Prompt→4-6层（中层）；时序运动Prompt→7-9层（高层），完全无重叠 | 低层负责模态纹理细节对齐，中层负责跨模态语义融合，高层负责全局运动建模，层间完全解耦，无梯度竞争 |
-| ICCV2025 M3PT | 仅在ViT每个阶段的首尾层注入Prompt，中间层完全保留预训练权重；模态Prompt注入前半段，融合Prompt注入后半段 | 最小化对预训练主干的破坏，仅在特征语义变化的关键节点注入Prompt，避免全层注入导致的特征分布偏移 |
-| ICML2025 MPT | 时序运动Prompt仅注入Transformer后3层，完全不碰低层 | ViT高层特征更关注全局语义和运动模式，低层聚焦纹理细节，时序信息无需在低层注入，避免干扰模态特征学习 |
+## 一、从曲线定位的5个致命问题（100%对应你的代码缺陷）
+### 1. 门控完全锁死，三分支直接退化为单TIR分支，多Prompt架构彻底失效
+**曲线铁证**：
+- `Consistency/avg_rgb_weight`从0.5直接跌到0，全程躺平，RGB分支完全不工作；
+- `avg_tir_weight`从0直接涨到1，全程锁死，TIR分支独占了所有贡献；
+- `avg_weight`（一致性分支）直接跌到0，一致性模块完全失效；
+- `weight_dist`从stage1的均匀分布，到stage2/3直接挤到0.9，门控完全one-hot化，彻底退化为单分支。
 
-### 你的实现的优势与核心缺陷
-✅ 正确的改进：你已经实现了「Consistency独占5-6层、Temporal独占8-9层、仅第7层过渡重叠」的分层解耦，方向100%契合顶会主流逻辑，解决了全层注入的核心问题。
-❌ 致命缺陷：
-1.  **缺失低层模态专属注入**：没有给RGB/TIR模态专属Prompt分配前3层的固定注入位置，导致低层跨模态基础对齐没做好，中高层的一致性、时序Prompt没有底层特征支撑，泛化性极差；
-2.  **重叠层无梯度隔离**：第7层的双分支重叠注入，没有做梯度隔离，导致两个分支在该层的梯度互相干扰、特征污染，出现「1+1<1」的内耗；
-3.  **无输入层基础对齐**：没有在Patch Embedding后（输入层）做基础的模态类型Prompt注入，预训练主干无法区分不同模态的Token，后续注入的Prompt效果大打折扣。
+**代码根因**：
+1.  门控初始化偏置错误，给TIR分支的初始权重过高，初始阶段就压制了RGB分支；
+2.  正则损失反向诱导，模型走了致命捷径：**直接把RGB/一致性分支的门控压到0，只用TIR分支，就能同时满足KL散度、正交正则的约束，还能降低定位损失**，完全违背了多分支协同的初衷。
 
-### 你可直接参考的优化
-1.  补全**分层注入分工**：
-    - 1-3层：仅注入RGB/TIR模态专属Prompt，负责低层跨模态纹理对齐；
-    - 5-6层：仅注入Consistency Prompt，负责中层跨模态语义融合；
-    - 7层：仅做过渡融合，不做双分支同时注入，避免竞争；
-    - 8-9层：仅注入Temporal Prompt，负责高层运动建模；
-2.  新增**输入层类型Prompt**：给RGB/TIR模态分别学习1个可学习的类型Token，拼接到Patch Embedding序列中，让预训练主干天生区分模态特征，和ViPT原生设计兼容，几乎不增加参数量。
+### 2. 正则损失完全反客为主，模型根本没在学核心跟踪能力
+**曲线铁证**：
+- `consistency_reg`/`kl_reg`/`ortho_reg`全程主导Loss下降，而核心的`giou`/`l1`/`location` Loss下降极缓、后期剧烈震荡；
+- `temporal_reg`/`mask_reg`全程为0，完全没有任何梯度回传，加了等于没加。
+
+**代码根因**：
+1.  正则项权重设置过高，模型为了最小化总Loss，优先满足正则约束，而不是优化定位精度；
+2.  KL散度、正交正则的计算逻辑完全错误，给了模型走捷径的空间——压死弱分支就能降低正则损失，而不是学习互补特征。
+
+### 3. 时序分支完全失效，没有任何贡献
+**曲线铁证**：`Loss/temporal_reg`全程为0，没有任何梯度回传，和你上一版的问题完全一致。
+
+**代码根因**：
+时序特征传递的逻辑还是错误的，`prev_features`没有正确传入上一帧的完整特征，同时时序损失没有正确绑定到总Loss里，梯度完全没回传，时序模块全程躺平。
+
+### 4. 梯度爆炸+训练极不稳定，收敛性极差
+**曲线铁证**：
+- `Consistency/grad_norm`从0持续涨到0.06，翻了6倍，梯度严重爆炸；
+- `prompt_mean`剧烈震荡，完全没有收敛趋势；
+- 不同run的IoU曲线差异极大，最高0.68、最低0.64，训练完全不可控。
+
+**代码根因**：
+1.  梯度裁剪阈值设置过高，门控锁死导致弱分支梯度消失、强分支梯度持续放大，最终爆炸；
+2.  没有给不同分支设置差异化学习率，强分支学习率过高，弱分支学习率完全不足以更新。
+
+### 5. 三阶段训练的冻结逻辑完全错误，每个阶段的目标都没达成
+**曲线铁证**：
+- stage1就出现RGB分支被压死、门控锁死，完全没达成「模态专属特征收敛」的目标；
+- stage2一致性分支权重直接跌到0，没达成「跨模态对齐」的目标；
+- stage3联合微调完全没提升，性能和stage1持平，早停直接触发。
+
+**代码根因**：
+1.  每个阶段的冻结范围错误：stage1不该放开一致性分支的训练，导致初始阶段就出现分支恶性竞争；
+2.  stage2冻结了模态分支，但模态分支已经躺平，一致性分支根本没有有效输入，完全学不到东西；
+3.  早停逻辑滥用：stage1/2不该早停，必须训满固定epoch确保基础能力收敛，只有stage3需要早停防过拟合。
 
 ---
 
-## 二、注入强度：顶会主流方案 vs 你的实现
-### 顶会核心共识：弱注入、动态缩放、与模态质量/层深度绑定
-ViPT原生的核心优势是**低参微调、弱注入不破坏预训练特征分布**，近两年顶会工作严格遵循这个逻辑，彻底抛弃了强注入设计：
-1.  **强度范围严格压缩**：CVPR2024 Un-Track、TPAMI2025 CMDTrack等主流方案，注入强度α的范围严格控制在**0.05~0.2**，和ViPT原生α=0.1完全对齐，公式统一为`x = x_origin + α * prompt_feat`，保证原始预训练特征占绝对主导，Prompt仅做微调修正；
-2.  **强度与层深度绑定**：低层注入强度≤0.1（避免破坏预训练的底层纹理特征），高层注入强度上限0.2（高层语义特征容错率更高），符合ViT的特征学习规律；
-3.  **强度与模态质量动态绑定**：ICCV2025 FlexTrack提出，通过特征熵值实时计算模态质量，清晰模态（如白天RGB）的注入强度上限0.2，劣质模态（如夜间噪声RGB）的注入强度上限0.05，避免劣质模态的Prompt污染全局特征。
+## 二、分优先级的落地修复方案（按顺序执行，立即可见效）
+### 优先级1：10分钟修改，解决门控锁死+正则反向诱导，让三分支都能正常工作
+#### 1. 修正门控初始化，从根源避免初始竞争
+**修改文件**：`meta_prompt.py` layer_gates初始化部分
+```python
+# 1-3层（模态专属层）：固定RGB/TIR均等初始权重，一致性分支初始不抢主导
+for layer_id in [1,2,3]:
+    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.5, 0.5, -1.0])
+    # sigmoid(0.5)=0.62，RGB/TIR初始均等；sigmoid(-1.0)=0.27，一致性分支弱初始化
 
-### 你的实现的核心缺陷
-你之前的代码中，注入强度`effective_gate = 0.2 + 0.8 * gate`，范围是**0.2~1.0**，是ViPT原生强度的2-10倍，直接导致两个致命问题：
-1.  完全破坏了预训练ViT的特征分布，冻结主干失去意义，模型被迫用少量跟踪数据重新学习特征，必然严重过拟合（对应你Tensorboard中15epoch后Loss反弹、IoU暴跌）；
-2.  门控的微小差异被放大10倍，弱分支的梯度几乎完全消失，出现「赢者通吃」的单分支主导，三提示完全退化为单提示，甚至更差。
+# 5-6层（一致性专属层）：固定一致性分支高初始权重，模态分支弱贡献
+for layer_id in [5,6]:
+    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, 1.0])
 
-### 你可直接参考的优化
-1.  直接修正注入强度范围，和顶会对齐：
-    ```python
-    # 替换你原有的强注入代码
-    effective_gate = 0.05 + 0.15 * gate[:, idx:idx+1].unsqueeze(-1)
-    ```
-2.  分层设置强度上限：1-3层低层上限0.1，5-9层中高层上限0.2，和层深度绑定；
-3.  新增模态质量动态缩放：通过RGB/TIR特征的熵值计算质量系数，熵值越高（噪声越大），该模态Prompt的注入强度越低，实现自适应弱注入。
+# 8-9层（时序专属层）：固定时序分支高初始权重，模态分支弱贡献
+for layer_id in [8,9]:
+    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, 1.0])
 
----
+# 第7层过渡层：三分支均等初始权重
+self.layer_gates["7"][-1].bias.data = torch.tensor([0.0, 0.0, 0.0])
+```
 
-## 三、多Prompt协同策略：顶会主流方案 vs 你的实现
-### 顶会核心共识：分阶段训练+职责硬约束+特征正交化，彻底解决分支内耗
-这是你三提示精度上不去的**核心根源**，近两年顶会的多Prompt协同，完全抛弃了「端到端联合训练、无约束自由竞争」的设计，核心是**强制每个Prompt分支做专属的事，学互补的特征，从根源上避免内耗**：
-1.  **分阶段训练，避免初始梯度拉扯**
-    - ACM MM2025 LRPD提出两阶段训练：第一阶段仅训练模态专属Prompt，让RGB/TIR分支先学到稳定的判别性特征；第二阶段冻结模态分支，训练一致性Prompt做跨模态对齐；第三阶段用1e-4的极低学习率联合微调，彻底避免了初始阶段多分支的梯度反向拉扯；
-    - ICML2025 MPT先单独预训练时序Prompt模块，让其先学到稳定的运动建模能力，再接入主干和模态Prompt联合微调，避免时序分支和模态分支的优化目标冲突。
-2.  **职责硬约束，每个分支有专属优化目标**
-    ICCV2025 M3PT、AAAI2024 BAT等方案，给每个Prompt分支设计了专属的损失函数，而不是仅用最终的定位损失，强制分支职责清晰：
-    - 模态专属Prompt：加模态内分类损失，仅负责学习自身模态的独特判别性特征；
-    - 一致性Prompt：加跨模态KL散度损失，仅负责对齐双模态的语义分布；
-    - 时序Prompt：加帧间特征平滑损失，仅负责建模目标的运动变化规律。
-3.  **特征正交正则，强制互补无冗余**
-    顶会方案普遍给多Prompt分支加**正交正则约束**，强制模态专属特征和共享特征、时序特征和表观特征互相正交，彻底解决特征冗余、互相污染的问题，保证1+1+1>3的协同增益。
+#### 2. 把正则权重降2个数量级，让定位损失绝对主导优化
+**修改文件**：`vipt.py` 损失计算部分
+```python
+# 总损失 = 定位损失（绝对主导） + 极弱正则约束
+total_loss = giou_loss * 2.0 + l1_loss * 3.0
 
-### 你的实现的核心缺陷
-1.  **端到端联合训练，无分阶段**：三个分支同时优化，初始阶段梯度互相拉扯，模型根本无法收敛到最优解，甚至出现反向优化；
-2.  **无专属损失约束，职责完全模糊**：三个分支的优化目标只有最终的定位损失，导致所有分支都去学习容易拟合的表观特征，而不是互补的模态/时序/一致性特征，出现严重的特征冗余；
-3.  **无正交正则，分支内耗严重**：没有强制分支特征差异化，三个分支学到的特征高度重叠，甚至冲突，最终出现「三提示不如双提示、双提示不如单提示」的结果。
+# 1. 一致性KL散度损失：权重从1e-4降到1e-6，绝对不能超过总Loss的1%
+if 'token_consistency' in inject_intermediates:
+    consistency_loss = F.kl_div(
+        F.log_softmax(rgb_target_feat, dim=-1),
+        F.softmax(tir_target_feat, dim=-1),
+        reduction='batchmean'
+    )
+    total_loss += 1e-6 * consistency_loss
 
-### 你可直接参考的优化
-1.  **三阶段训练流程，直接套用**：
-    - 阶段1（10epoch）：冻结Consistency、Temporal分支，仅训练RGB/TIR模态专属Prompt，让模态特征先收敛；
-    - 阶段2（5epoch）：冻结模态专属分支，仅训练Consistency、Temporal分支，让对齐和运动建模能力收敛；
-    - 阶段3（15epoch）：解冻所有分支，用3e-4的极低学习率联合微调，配合早停机制，实现三分支协同收敛。
-2.  **新增分支专属损失，绑定优化目标**：
-    ```python
-    # 总损失 = 定位损失 + 分支专属正则损失
-    total_loss = giou_loss * 2.0 + l1_loss * 3.0
-    # 1. 一致性分支：跨模态KL散度损失
-    if 'token_consistency' in inject_intermediates:
-        consistency_loss = F.kl_div(rgb_feat.softmax(-1), tir_feat.softmax(-1))
-        total_loss += 1e-4 * consistency_loss
-    # 2. 时序分支：帧间平滑损失
-    if 'temporal_weight' in inject_intermediates:
+# 2. 正交正则损失：权重从5e-5降到5e-6，仅约束Prompt投影矩阵，不约束特征
+if 'branch_prompts' in inject_intermediates:
+    rgb_p, tir_p, consist_p = inject_intermediates['branch_prompts']
+    # 对Prompt的投影矩阵做正交约束，模型无法通过压死特征走捷径
+    ortho_loss = torch.norm(torch.mm(rgb_p.T, tir_p), p=2) + torch.norm(torch.mm(rgb_p.T, consist_p), p=2)
+    total_loss += 5e-6 * ortho_loss
+
+# 3. 时序平滑损失：权重1e-6，仅做弱约束
+if 'temporal_weight' in inject_intermediates:
+    temporal_weight = inject_intermediates['temporal_weight']
+    if temporal_weight.shape[0] > 1:
         temporal_loss = torch.norm(temporal_weight[1:] - temporal_weight[:-1], p=1)
-        total_loss += 1e-5 * temporal_loss
-    # 3. 正交正则：强制三个分支特征正交，解决冗余内耗
-    feat_rgb, feat_tir, feat_consist = branch_feats
-    ortho_loss = torch.norm(torch.mm(feat_rgb.T, feat_tir), p=2) + torch.norm(torch.mm(feat_rgb.T, feat_consist), p=2)
-    total_loss += 5e-5 * ortho_loss
-    ```
+        total_loss += 1e-6 * temporal_loss
+```
 
----
+### 优先级2：30分钟修改，解决时序分支失效+正则计算逻辑错误
+#### 1. 彻底修复时序特征传递逻辑，让时序模块真正生效
+**修改文件**：`vit_ce_prompt.py` `_forward_features_meta`方法
+```python
+def _forward_features_meta(self, x, tir_feat=None, prev_frame_feat=None, is_first_frame=False):
+    # 1. 首帧强制清空时序缓存，避免batch维度不匹配
+    if is_first_frame:
+        self.prev_frame_feat = None
+        self.meta_prompt_generator.reset_temporal_cache()
+    
+    B, N, C = x.shape
+    # 2. Patch Embedding后，先做模态类型Token注入（和ViPT原生兼容）
+    x = self.patch_embed(x)
+    if tir_feat is not None:
+        tir_feat = self.patch_embed(tir_feat)
+        # 模态类型Token，仅1个可学习参数，几乎不增加参数量
+        x = x + self.rgb_type_token
+        tir_feat = tir_feat + self.tir_type_token
 
-## 四、门控与权重分配：顶会主流方案 vs 你的实现
-### 顶会核心共识：sigmoid独立门控替代softmax互斥门控，实现真正的协同
-近两年顶会工作**100%抛弃了softmax门控**，核心原因是softmax强制多分支权重和为1，天然造成零和博弈、分支互斥，完全违背多Prompt协同的初衷，主流设计如下：
-1.  **sigmoid独立门控**：ICCV2025 CVPT、CVPR2025 DMP均采用sigmoid独立门控，每个Prompt分支的权重独立计算，取值范围0~1，互不影响，允许多个分支同时拥有高权重，真正实现协同贡献，在VTAB-1K基准上比softmax门控精度高4%；
-2.  **输入感知动态门控**：门控权重不是仅和层深度绑定，而是和输入的模态质量、运动幅度实时关联，比如运动幅度大时自动提升时序Prompt的门控权重，低光场景自动提升TIR模态Prompt的门控权重；
-3.  **稀疏化约束**：给门控权重加L1正则，强制模型在不同层仅激活对应的专属Prompt分支，避免所有分支在所有层都激活，减少冗余计算和特征干扰。
+    # 3. Transformer前向传播，仅在专属层注入对应Prompt
+    for i, blk in enumerate(self.blocks):
+        # 仅在当前层是注入层时，才调用inject，非注入层完全不碰
+        if i in self.inject_layers:
+            x_modulated, inject_intermediates = self.meta_prompt_generator.inject(
+                current_layer_id=i,
+                x_search=x,
+                tir_feat=tir_feat,
+                prev_features=prev_frame_feat,  # 传入上一帧完整特征，不是当前层中间特征
+            )
+            x = x_modulated
+        # 正常前向传播，绝对不能在循环里覆盖prev_frame_feat
+        x, _, _ = blk(x)
+    
+    # 4. 仅在每帧结束后，保存当前帧的完整特征，给下一帧用
+    self.prev_frame_feat = x.detach()
+    return x, inject_intermediates
+```
 
-### 你的实现的核心缺陷
-你之前的代码用了`F.softmax(gate_logits, dim=-1)`，强制三个分支的门控权重和为1，直接造成**零和博弈、分支互斥**：一个分支权重上升，另外两个必然下降，低层Consistency权重0.9，Temporal和模态分支就只剩0.05，完全失去贡献，三提示直接退化为单提示，甚至因为强制竞争导致特征内耗，精度比单提示更差。
+#### 2. 修正KL散度计算逻辑，彻底堵死模型走捷径的空间
+**修改文件**：`meta_prompt.py` consistency分支计算部分
+```python
+# 只对目标区域的Token做KL对齐，不是整个特征图，模型无法通过压死一个分支降低损失
+def compute_token_consistency(self, rgb_feat, tir_feat, target_mask=None):
+    # target_mask是目标区域的二值mask，来自上一帧的跟踪结果
+    if target_mask is not None:
+        # 仅取目标区域的Token计算KL散度
+        rgb_target_feat = rgb_feat[target_mask > 0.5]
+        tir_target_feat = tir_feat[target_mask > 0.5]
+    else:
+        # 无mask时，取前10%的高响应Token（目标区域）
+        rgb_norm = torch.norm(rgb_feat, dim=-1)
+        tir_norm = torch.norm(tir_feat, dim=-1)
+        topk_num = int(rgb_feat.shape[1] * 0.1)
+        rgb_topk_idx = torch.topk(rgb_norm, topk_num, dim=1).indices
+        tir_topk_idx = torch.topk(tir_norm, topk_num, dim=1).indices
+        # 取交集，保证是共同的目标区域
+        target_idx = torch.intersect1d(rgb_topk_idx, tir_topk_idx)
+        rgb_target_feat = rgb_feat[:, target_idx, :]
+        tir_target_feat = tir_feat[:, target_idx, :]
+    
+    # 计算KL散度，双向对称，避免单向对齐导致一个分支消失
+    kl_1 = F.kl_div(F.log_softmax(rgb_target_feat, dim=-1), F.softmax(tir_target_feat, dim=-1), reduction='batchmean')
+    kl_2 = F.kl_div(F.log_softmax(tir_target_feat, dim=-1), F.softmax(rgb_target_feat, dim=-1), reduction='batchmean')
+    return (kl_1 + kl_2) / 2
+```
 
-### 你可直接参考的优化
-1.  **直接替换门控函数，彻底解决互斥问题**：
+### 优先级3：修正三阶段训练的冻结逻辑+早停规则，确保每个阶段目标达成
+#### 1. 精准的三阶段冻结规则（必须严格执行）
+| 训练阶段 | 训练轮次 | 可训练参数 | 冻结参数 | 核心目标 | 早停规则 |
+|----------|----------|------------|----------|----------|----------|
+| Stage1 | 固定10epoch，**禁止早停** | 仅RGB/TIR模态专属Prompt的参数 | 一致性分支、时序分支、所有门控参数、ViT主干 | 让两个模态分支学到稳定的专属特征，门控固定，无竞争 | 必须训满10epoch，不看验证集IoU |
+| Stage2 | 固定5epoch，**禁止早停** | 仅一致性分支、时序分支的参数 | 模态专属Prompt、所有门控参数、ViT主干 | 让一致性/时序分支在固定的模态特征基础上学习，无竞争 | 必须训满5epoch，不看验证集IoU |
+| Stage3 | 最多20epoch，**仅这里用早停** | 所有Prompt分支、门控参数 | ViT主干全程冻结 | 三分支协同微调，实现1+1+1>3 | 验证集IoU连续3epoch不上升，立即停止 |
+
+#### 2. 超参精准匹配三阶段训练
+```yaml
+# Stage1 超参
+TRAIN:
+  BATCH_SIZE: 32
+  EPOCH: 10
+  LR: 0.0003
+  GRAD_CLIP_NORM: 0.1
+  WEIGHT_DECAY: 0.0005
+
+# Stage2 超参
+TRAIN:
+  BATCH_SIZE: 32
+  EPOCH: 5
+  LR: 0.0001
+  GRAD_CLIP_NORM: 0.1
+  WEIGHT_DECAY: 0.0005
+
+# Stage3 超参
+TRAIN:
+  BATCH_SIZE: 32
+  EPOCH: 20
+  LR: 0.0001
+  LR_DROP_EPOCH: 15
+  GRAD_CLIP_NORM: 0.1
+  WEIGHT_DECAY: 0.0005
+  VAL_EPOCH_INTERVAL: 1
+```
+
+### 优先级4：兜底优化，解决梯度爆炸+训练不稳定
+1.  **差异化学习率**：给不同分支设置不同学习率，避免强分支梯度放大
     ```python
-    # 原错误代码
-    gate = F.softmax(gate_logits, dim=-1)
-    # 替换为顶会主流的独立门控
-    gate = torch.sigmoid(gate_logits)
+    # 优化器参数分组
+    param_groups = [
+        {"params": model.module.backbone.meta_prompt_generator.rgb_prompt.parameters(), "lr": 1e-4},
+        {"params": model.module.backbone.meta_prompt_generator.tir_prompt.parameters(), "lr": 1e-4},
+        {"params": model.module.backbone.meta_prompt_generator.consist_prompt.parameters(), "lr": 5e-5},
+        {"params": model.module.backbone.meta_prompt_generator.temporal_prompt.parameters(), "lr": 5e-5},
+        {"params": model.module.backbone.meta_prompt_generator.layer_gates.parameters(), "lr": 1e-5},
+    ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.TRAIN.WEIGHT_DECAY)
     ```
-2.  **修正门控初始化偏置，匹配sigmoid逻辑**：
-    把原来的偏置值（如`[2.0, -2.0, -2.0]`）缩小一倍，改为`[1.0, -1.0, -1.0]`，sigmoid(1.0)=0.73，sigmoid(-1.0)=0.27，既保证了分支的初始优先级，又不会完全锁死其他分支，给梯度留了畅通的通道；
-3.  **新增输入感知门控**：把模态质量、运动幅度特征拼接到门控的输入中，让门控权重自适应场景变化，而不是仅和层深度绑定。
+2.  **梯度裁剪阈值从0.3降到0.1**，彻底解决梯度爆炸问题；
+3.  **Batch Norm冻结**：全程冻结ViT主干的所有Batch Norm层，避免少量跟踪数据破坏预训练的归一化统计量。
 
 ---
 
-## 五、最终落地执行优先级（按顺序来，立即可见效）
-1.  **优先级1（10分钟修改）**：把softmax门控替换为sigmoid独立门控，修正注入强度范围，先解决分支互斥、特征分布破坏的核心问题，精度直接打平双提示；
-2.  **优先级2（30分钟修改）**：补全分层注入分工，给模态专属Prompt分配低层注入位置，去掉第7层的重叠注入，解决特征污染问题；
-3.  **优先级3（1小时修改）**：新增分支专属损失和正交正则，绑定每个分支的优化目标，从根源上解决分支内耗；
-4.  **优先级4（训练流程修改）**：采用三阶段训练策略，配合早停机制，让三分支稳定协同收敛，最终实现三提示精度超过单/双提示。
+## 三、验证执行步骤（按顺序来，稳扎稳打）
+1.  先执行优先级1的修改，跑Stage1，验证：`avg_rgb_weight`和`avg_tir_weight`稳定在0.4-0.6之间，不会跌到0，两个模态分支都正常工作；
+2.  再执行优先级2的修改，跑Stage2，验证：`avg_weight`稳定在0.5-0.7之间，一致性分支正常工作，`temporal_reg`不再为0，时序模块有梯度回传；
+3.  执行优先级3+4的修改，跑Stage3，验证：三个分支的权重稳定在0.2-0.8之间，没有锁死，IoU稳定上升，超过单/双提示基线；
+4.  最终用早停保存最优模型，完成三分支协同收敛。

@@ -22,6 +22,7 @@
 
 # ==================== 导入必要的库 ====================
 import os  # 操作系统库，用于路径操作、目录创建等
+import torch.nn as nn  # 【v25】BN冻结需要
 
 # ==================== 损失函数相关 ====================
 from lib.utils.box_ops import giou_loss  # GIoU损失，用于边界框回归
@@ -180,6 +181,16 @@ def run(settings):
     else:
         # 单GPU训练模式
         settings.device = torch.device("cuda:0")
+
+    # 【v25修复】全程冻结BN层，防止小batch统计不稳定导致训练崩溃
+    freeze_bn = getattr(cfg.TRAIN, "FREEZE_BN", False)
+    if freeze_bn:
+        for m in net.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+        print(f"[v25] 已冻结全部BN层 (FREEZE_BN={freeze_bn})")
 
     # ==================== 第七步：从配置中读取训练选项 ====================
     # 深度监督：在训练中间层添加辅助损失

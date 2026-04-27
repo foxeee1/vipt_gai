@@ -181,6 +181,9 @@ class VisionTransformerCE(VisionTransformer):
                 else:
                     meta_prompt_inject_layers = []
             self.meta_prompt_inject_layers = meta_prompt_inject_layers
+            self.temporal_prompt_inject_layers = temporal_prompt_inject_layers if temporal_prompt_inject_layers else []
+            self.mask_prompt_inject_layers = mask_prompt_inject_layers if mask_prompt_inject_layers else []
+            self.modality_prompt_inject_layers = modality_prompt_inject_layers if modality_prompt_inject_layers else [1, 2, 3]
 
             _logger.info(f"[Meta Path] Base Prompt layers: {self.base_prompt_inject_layers}")
             _logger.info(f"[Meta Path] Meta Prompt layers: {self.meta_prompt_inject_layers}")
@@ -510,15 +513,18 @@ class VisionTransformerCE(VisionTransformer):
 
         removed_indexes_s = []
         meta_prompt_len = self.meta_prompt_generator.total_prompt_len
-        # 【统一格式】META_PROMPT_INJECT_LAYERS = [layer1, layer2, ...] 任意层列表
-        # 例如: [9, 10, 11, 12] 表示在第9、10、11、12层都注入meta prompt
-        #       [9, 10] 表示只在第9、10层注入
+        # 【统一格式】所有注入层的并集，确保Temporal/Mask/Modality层也能触发inject
         inject_layers = self.meta_prompt_inject_layers
-        inject_layers_set = set(inject_layers) if inject_layers else set()
+        inject_layers_set = (
+            set(inject_layers) |
+            set(self.temporal_prompt_inject_layers) |
+            set(self.mask_prompt_inject_layers) |
+            set(self.modality_prompt_inject_layers)
+        ) if (inject_layers or self.temporal_prompt_inject_layers or self.mask_prompt_inject_layers or self.modality_prompt_inject_layers) else set()
 
         # 【调试日志】只在首次forward时打印一次（避免刷屏）
         if not getattr(self, '_inject_layers_printed', False):
-            print(f"[DEBUG] META_PROMPT_INJECT_LAYERS = {inject_layers}, inject_layers_set = {inject_layers_set}")
+            print(f"[DEBUG] inject_layers_set = {inject_layers_set} (meta={inject_layers}, temporal={self.temporal_prompt_inject_layers}, mask={self.mask_prompt_inject_layers}, modality={self.modality_prompt_inject_layers})")
             self._inject_layers_printed = True
 
         # 每层独立计算并注入meta prompt（逐层注入，非最后统一融合）
