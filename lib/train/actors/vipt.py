@@ -165,15 +165,139 @@ class ViPTActor(BaseActor):
             location_loss = self.objective['focal'](pred_dict['score_map'], gt_gaussian_maps)
         else:
             location_loss = torch.tensor(0.0, device=l1_loss.device)
-        # weighted sum
+
+        # 【v26核心修复】分阶段专属Loss路由 — 解决分支失效的根本原因
+        stage = getattr(self.cfg.TRAIN, 'STAGE', 0)
+
+        if stage == 1:
+            return self._compute_stage1_loss(giou_loss, l1_loss, location_loss, iou, pred_dict, return_status)
+        elif stage == 2:
+            return self._compute_stage2_loss(giou_loss, l1_loss, location_loss, iou, pred_dict, return_status)
+        elif stage == 3:
+            return self._compute_stage3_loss(giou_loss, l1_loss, location_loss, iou, pred_dict, return_status)
+        else:
+            return self._compute_legacy_loss(giou_loss, l1_loss, location_loss, iou, pred_dict, return_status)
+
+    def _compute_stage1_loss(self, giou_loss, l1_loss, location_loss, iou, pred_dict, return_status):
+        """Stage1: 仅定位Loss，完全屏蔽所有正则化，让模态分支专注学习表观特征"""
+        tracking_loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss + self.loss_weight['focal'] * location_loss
+        loss = tracking_loss
+
+        if return_status:
+            mean_iou = iou.detach().mean()
+            status = {"Loss/total": loss.item(),
+                      "Loss/giou": giou_loss.item(),
+                      "Loss/l1": l1_loss.item(),
+                      "Loss/location": location_loss.item(),
+                      "Loss/consistency_reg": 0.0,
+                      "Loss/temporal_reg": 0.0,
+                      "Loss/mask_reg": 0.0,
+                      "Loss/ortho_reg": 0.0,
+                      "Loss/kl_reg": 0.0,
+                      "Train/weight_var": 0.0,
+                      "Train/weight_entropy": 0.0,
+                      "IoU": mean_iou.item(),
+                      "Stage": 1}
+            return loss, status
+        return loss
+
+    def _compute_stage2_loss(self, giou_loss, l1_loss, location_loss, iou, pred_dict, return_status):
+        """Stage2: 定位Loss降权 + 辅助分支专属Loss主导，强制辅助分支学习互补能力"""
+        tracking_loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss + self.loss_weight['focal'] * location_loss
+        loss = tracking_loss * 0.5
+
+        current_reg_loss = 0.0
+        current_temporal_reg = 0.0
+        current_mask_reg = 0.0
+        current_ortho_reg = 0.0
+        current_kl_reg = 0.0
+        current_weight_var = None
+        current_weight_entropy = None
+
+        inject_intermediates = pred_dict.get('inject_intermediates', {})
+
+        # ===== 一致性分支专属Loss：token一致性约束（权重1e-3主导） =====
+        if 'consistency_intermediates' in inject_intermediates:
+            consistency_data = inject_intermediates['consistency_intermediates']
+            if consistency_data is not None and isinstance(consistency_data, dict):
+                token_weight = consistency_data.get('token_consistency')
+                if token_weight is not None:
+                    token_weight = token_weight.squeeze(-1)
+                    weight_var = torch.var(token_weight, dim=1)
+                    current_weight_var = weight_var.mean().item()
+                    num_tokens = max(token_weight.shape[1], 1)
+                    consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
+                    loss = loss + 1e-3 * consistency_reg_loss
+                    current_reg_loss = consistency_reg_loss.item()
+
+        # ===== 时序分支专属Loss：帧间平滑 + 运动门控约束（权重1e-3主导） =====
+        if 'temporal_intermediates' in inject_intermediates:
+            temporal_data = inject_intermediates['temporal_intermediates']
+            if temporal_data is not None and isinstance(temporal_data, dict):
+                tw = temporal_data.get('temporal_weight')
+                if tw is not None:
+                    temporal_reg_loss = torch.norm(tw, p=2) * 0.5
+                    prev_tw = temporal_data.get('prev_temporal_weight')
+                    if prev_tw is not None and prev_tw.shape == tw.shape:
+                        temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
+                    loss = loss + 1e-3 * temporal_reg_loss
+                    current_temporal_reg = temporal_reg_loss.item()
+                    global_motion = temporal_data.get('global_motion')
+                    if global_motion is not None:
+                        motion_gate_loss = -torch.mean(global_motion * tw.mean(dim=1, keepdim=True))
+                        loss = loss + 1e-4 * motion_gate_loss
+
+        # ===== Mask分支专属Loss：目标区域特征响应增强（权重1e-3主导） =====
+        if 'mask_intermediates' in inject_intermediates:
+            mask_data = inject_intermediates['mask_intermediates']
+            if mask_data is not None and isinstance(mask_data, dict):
+                token_reliability = mask_data.get('token_reliability')
+                if token_reliability is not None:
+                    token_reliability = token_reliability.squeeze(-1)
+                    mask_reg_loss = torch.norm(token_reliability, p=2)
+                    mean_reliability = token_reliability.mean()
+                    target_resp_loss = -torch.mean(torch.relu(mean_reliability - 0.3))
+                    loss = loss + 1e-3 * mask_reg_loss + 1e-4 * target_resp_loss
+                    current_mask_reg = mask_reg_loss.item()
+
+        # ===== 跨模态双向KL散度（权重1e-4，Stage2适度对齐） =====
+        if 'branch_feats' in inject_intermediates:
+            bf = inject_intermediates['branch_feats']
+            rgb_f = bf.get('rgb_mean')
+            tir_f = bf.get('tir_mean')
+            if rgb_f is not None and tir_f is not None:
+                rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                rgb_prob = F.softmax(rgb_f, dim=-1)
+                tir_prob = F.softmax(tir_f, dim=-1)
+                kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
+                kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
+                kl_loss = (kl_rt + kl_tr) / 2.0
+                loss = loss + 1e-4 * kl_loss
+                current_kl_reg = kl_loss.item()
+
+        if return_status:
+            mean_iou = iou.detach().mean()
+            status = {"Loss/total": loss.item(),
+                      "Loss/giou": giou_loss.item(),
+                      "Loss/l1": l1_loss.item(),
+                      "Loss/location": location_loss.item(),
+                      "Loss/consistency_reg": current_reg_loss,
+                      "Loss/temporal_reg": current_temporal_reg,
+                      "Loss/mask_reg": current_mask_reg,
+                      "Loss/ortho_reg": current_ortho_reg,
+                      "Loss/kl_reg": current_kl_reg,
+                      "Train/weight_var": current_weight_var if current_weight_var else 0.0,
+                      "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
+                      "IoU": mean_iou.item(),
+                      "Stage": 2}
+            return loss, status
+        return loss
+
+    def _compute_stage3_loss(self, giou_loss, l1_loss, location_loss, iou, pred_dict, return_status):
+        """Stage3: 定位Loss绝对主导 + 辅助Loss极低（≤1e-6），仅做弱约束"""
         tracking_loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss + self.loss_weight['focal'] * location_loss
         loss = tracking_loss.clone()
-
-        # 【v22修复】动态loss平衡：正则化权重随tracking_loss自适应缩放
-        # 原理：tracking_loss大时→正则化权重小（让模型专注跟踪）
-        #       tracking_loss小时→正则化权重大（强化约束）
-        # 避免正则化和主任务对抗
-        tracking_loss_val = tracking_loss.item() + 1e-8
 
         current_weight_var = None
         current_weight_entropy = None
@@ -186,50 +310,41 @@ class ViPTActor(BaseActor):
         if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
             inject_intermediates = pred_dict['inject_intermediates']
 
-            # ===== Consistency轻量正则（L2范数约束，归一化到token数量） =====
             if 'consistency_intermediates' in inject_intermediates:
                 consistency_data = inject_intermediates['consistency_intermediates']
                 if consistency_data is not None and isinstance(consistency_data, dict):
-                    token_weight = None
-                    if 'token_consistency' in consistency_data:
-                        token_weight = consistency_data['token_consistency'].squeeze(-1)
-
+                    token_weight = consistency_data.get('token_consistency')
                     if token_weight is not None:
+                        token_weight = token_weight.squeeze(-1)
                         weight_var = torch.var(token_weight, dim=1)
                         current_weight_var = weight_var.mean().item()
-                        # 【v25修复】除以token数量归一化，避免token数多导致reg爆炸
                         num_tokens = max(token_weight.shape[1], 1)
                         consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
                         loss = loss + 1e-6 * consistency_reg_loss
                         current_reg_loss = consistency_reg_loss.item()
 
-            # ===== Temporal轻量正则（帧间平滑+L2范数） =====
             if 'temporal_intermediates' in inject_intermediates:
                 temporal_data = inject_intermediates['temporal_intermediates']
                 if temporal_data is not None and isinstance(temporal_data, dict):
-                    if 'temporal_weight' in temporal_data:
-                        tw = temporal_data['temporal_weight']
+                    tw = temporal_data.get('temporal_weight')
+                    if tw is not None:
                         temporal_reg_loss = torch.norm(tw, p=2) * 0.5
-                        if 'prev_temporal_weight' in temporal_data and temporal_data['prev_temporal_weight'] is not None:
-                            prev_tw = temporal_data['prev_temporal_weight']
-                            if prev_tw.shape == tw.shape:
-                                temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
-                        # 【v25修复】权重从1e-4降到1e-6
+                        prev_tw = temporal_data.get('prev_temporal_weight')
+                        if prev_tw is not None and prev_tw.shape == tw.shape:
+                            temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
                         loss = loss + 1e-6 * temporal_reg_loss
                         current_temporal_reg = temporal_reg_loss.item()
 
-            # ===== Mask轻量正则（L2范数约束） =====
             if 'mask_intermediates' in inject_intermediates:
                 mask_data = inject_intermediates['mask_intermediates']
                 if mask_data is not None and isinstance(mask_data, dict):
-                    if 'token_reliability' in mask_data:
-                        token_reliability = mask_data['token_reliability'].squeeze(-1)
+                    token_reliability = mask_data.get('token_reliability')
+                    if token_reliability is not None:
+                        token_reliability = token_reliability.squeeze(-1)
                         mask_reg_loss = torch.norm(token_reliability, p=2)
-                        # 【v25修复】权重从1e-4降到1e-6
                         loss = loss + 1e-6 * mask_reg_loss
                         current_mask_reg = mask_reg_loss.item()
 
-            # ===== 正交正则：强制分支特征互补无冗余（权重大幅降低） =====
             if 'branch_feats' in inject_intermediates:
                 bf = inject_intermediates['branch_feats']
                 rgb_f = bf.get('rgb_mean')
@@ -257,17 +372,14 @@ class ViPTActor(BaseActor):
 
                 if ortho_terms:
                     ortho_loss = sum(ortho_terms) / len(ortho_terms)
-                    # 【v25修复】权重从5e-5降到5e-7，防止反客为主
                     loss = loss + 5e-7 * ortho_loss
                     current_ortho_reg = ortho_loss.item()
 
-            # ===== 跨模态KL散度损失：双向对称，防止单向对齐导致分支消失 =====
             if 'branch_feats' in inject_intermediates:
                 bf = inject_intermediates['branch_feats']
                 rgb_f = bf.get('rgb_mean')
                 tir_f = bf.get('tir_mean')
                 if rgb_f is not None and tir_f is not None:
-                    # 【v25修复】双向对称KL散度，避免单向对齐导致一个分支消失
                     rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
                     tir_log_prob = F.log_softmax(tir_f, dim=-1)
                     rgb_prob = F.softmax(rgb_f, dim=-1)
@@ -275,7 +387,120 @@ class ViPTActor(BaseActor):
                     kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
                     kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
                     kl_loss = (kl_rt + kl_tr) / 2.0
-                    # 【v25修复】权重从1e-4降到1e-6
+                    loss = loss + 1e-6 * kl_loss
+                    current_kl_reg = kl_loss.item()
+
+        if return_status:
+            mean_iou = iou.detach().mean()
+            status = {"Loss/total": loss.item(),
+                      "Loss/giou": giou_loss.item(),
+                      "Loss/l1": l1_loss.item(),
+                      "Loss/location": location_loss.item(),
+                      "Loss/consistency_reg": current_reg_loss,
+                      "Loss/temporal_reg": current_temporal_reg,
+                      "Loss/mask_reg": current_mask_reg,
+                      "Loss/ortho_reg": current_ortho_reg,
+                      "Loss/kl_reg": current_kl_reg,
+                      "Train/weight_var": current_weight_var if current_weight_var else 0.0,
+                      "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
+                      "IoU": mean_iou.item(),
+                      "Stage": 3}
+            return loss, status
+        return loss
+
+    def _compute_legacy_loss(self, giou_loss, l1_loss, location_loss, iou, pred_dict, return_status):
+        """Legacy: 兼容非三阶段训练的原始逻辑"""
+        tracking_loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss + self.loss_weight['focal'] * location_loss
+        loss = tracking_loss.clone()
+
+        current_weight_var = None
+        current_weight_entropy = None
+        current_reg_loss = 0.0
+        current_temporal_reg = 0.0
+        current_mask_reg = 0.0
+        current_ortho_reg = 0.0
+        current_kl_reg = 0.0
+
+        if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
+            inject_intermediates = pred_dict['inject_intermediates']
+
+            if 'consistency_intermediates' in inject_intermediates:
+                consistency_data = inject_intermediates['consistency_intermediates']
+                if consistency_data is not None and isinstance(consistency_data, dict):
+                    token_weight = consistency_data.get('token_consistency')
+                    if token_weight is not None:
+                        token_weight = token_weight.squeeze(-1)
+                        weight_var = torch.var(token_weight, dim=1)
+                        current_weight_var = weight_var.mean().item()
+                        num_tokens = max(token_weight.shape[1], 1)
+                        consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
+                        loss = loss + 1e-6 * consistency_reg_loss
+                        current_reg_loss = consistency_reg_loss.item()
+
+            if 'temporal_intermediates' in inject_intermediates:
+                temporal_data = inject_intermediates['temporal_intermediates']
+                if temporal_data is not None and isinstance(temporal_data, dict):
+                    tw = temporal_data.get('temporal_weight')
+                    if tw is not None:
+                        temporal_reg_loss = torch.norm(tw, p=2) * 0.5
+                        prev_tw = temporal_data.get('prev_temporal_weight')
+                        if prev_tw is not None and prev_tw.shape == tw.shape:
+                            temporal_reg_loss = temporal_reg_loss + 0.5 * torch.mean((tw - prev_tw) ** 2)
+                        loss = loss + 1e-6 * temporal_reg_loss
+                        current_temporal_reg = temporal_reg_loss.item()
+
+            if 'mask_intermediates' in inject_intermediates:
+                mask_data = inject_intermediates['mask_intermediates']
+                if mask_data is not None and isinstance(mask_data, dict):
+                    token_reliability = mask_data.get('token_reliability')
+                    if token_reliability is not None:
+                        token_reliability = token_reliability.squeeze(-1)
+                        mask_reg_loss = torch.norm(token_reliability, p=2)
+                        loss = loss + 1e-6 * mask_reg_loss
+                        current_mask_reg = mask_reg_loss.item()
+
+            if 'branch_feats' in inject_intermediates:
+                bf = inject_intermediates['branch_feats']
+                rgb_f = bf.get('rgb_mean')
+                tir_f = bf.get('tir_mean')
+                cons_f = bf.get('consistency_mean')
+                temp_f = bf.get('temporal_mean')
+
+                ortho_terms = []
+                if rgb_f is not None and tir_f is not None:
+                    rgb_fn = rgb_f / (rgb_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    tir_fn = tir_f / (tir_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(rgb_fn.unsqueeze(1), tir_fn.unsqueeze(2)).squeeze(), p=2))
+                if rgb_f is not None and cons_f is not None:
+                    rgb_fn = rgb_f / (rgb_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(rgb_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+                if tir_f is not None and cons_f is not None:
+                    tir_fn = tir_f / (tir_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(tir_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+                if temp_f is not None and cons_f is not None:
+                    temp_fn = temp_f / (temp_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    cons_fn = cons_f / (cons_f.norm(dim=-1, keepdim=True) + 1e-8)
+                    ortho_terms.append(torch.norm(torch.bmm(temp_fn.unsqueeze(1), cons_fn.unsqueeze(2)).squeeze(), p=2))
+
+                if ortho_terms:
+                    ortho_loss = sum(ortho_terms) / len(ortho_terms)
+                    loss = loss + 5e-7 * ortho_loss
+                    current_ortho_reg = ortho_loss.item()
+
+            if 'branch_feats' in inject_intermediates:
+                bf = inject_intermediates['branch_feats']
+                rgb_f = bf.get('rgb_mean')
+                tir_f = bf.get('tir_mean')
+                if rgb_f is not None and tir_f is not None:
+                    rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                    tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                    rgb_prob = F.softmax(rgb_f, dim=-1)
+                    tir_prob = F.softmax(tir_f, dim=-1)
+                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
+                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
+                    kl_loss = (kl_rt + kl_tr) / 2.0
                     loss = loss + 1e-6 * kl_loss
                     current_kl_reg = kl_loss.item()
 
@@ -294,5 +519,4 @@ class ViPTActor(BaseActor):
                       "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
                       "IoU": mean_iou.item()}
             return loss, status
-        else:
-            return loss
+        return loss
