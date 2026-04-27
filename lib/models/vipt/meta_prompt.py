@@ -1136,51 +1136,61 @@ class CrossAttentionModulation(nn.Module):
         assert B == prompt.shape[0], f"[CrossAttentionModulation] batch维度不匹配！x: {B}, prompt: {prompt.shape[0]}"
         assert C % self.num_heads == 0, f"[CrossAttentionModulation] embed_dim必须能被num_heads整除！C={C}, num_heads={self.num_heads}"
 
-        # ===== Pre-LN =====
+        if torch.isnan(prompt).any() or torch.isnan(x).any():
+            return x.clone()
+
         q = self.norm_q(prompt)
         k = self.norm_k(x)
         v = x
 
-        # ===== QK投影 =====
+        if torch.isnan(q).any() or torch.isnan(k).any():
+            return x.clone()
+
         Q = self.q_proj(q)
         K = self.k_proj(k)
 
-        # Reshape for multi-head attention
+        if torch.isnan(Q).any() or torch.isnan(K).any():
+            return x.clone()
+
         Q = Q.view(B, L_p, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         K = K.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         V = v.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # ===== 数值稳定性保护 =====
         Q = torch.clamp(Q, min=-10.0, max=10.0)
         K = torch.clamp(K, min=-10.0, max=10.0)
 
-        # ===== 交叉注意力计算 =====
         attn = (Q @ K.transpose(-2, -1)) * self.scale
-        # 安全校验：softmax前减去最大值，防止指数溢出导致NaN
         attn = attn - attn.max(dim=-1, keepdim=True).values.detach()
+        attn = torch.clamp(attn, min=-10.0, max=10.0)
         attn = attn.softmax(dim=-1)
 
-        # 聚合到prompt级别 [B, L_p, C]
+        if torch.isnan(attn).any():
+            return x.clone()
+
         attn_out = (attn @ V).permute(0, 2, 1, 3).reshape(B, L_p, C)
 
-        # 轻量投影
+        if torch.isnan(attn_out).any():
+            return x.clone()
+
         attn_out = self.out_proj(attn_out)
 
-        # ===== 关键：Mean Pooling得到全局信号 [B, 1, C] =====
+        if torch.isnan(attn_out).any():
+            return x.clone()
+
         global_signal = attn_out.mean(dim=1, keepdim=True)
 
-        # 【v22修复】LayerNorm稳定调制信号分布
         global_signal = self.mod_norm(global_signal)
 
-        # 【v22修复】可学习调制强度，上限从0.3提升到1.0
-        # 原版alpha*0.3上限太小，70%梯度被截断
-        alpha = torch.sigmoid(self.alpha) * 1.0
+        if torch.isnan(global_signal).any():
+            return x.clone()
 
-        # 加法调制（广播到所有L个token）
+        alpha = torch.sigmoid(self.alpha) * 1.0
+        alpha = torch.clamp(alpha, min=0.0, max=1.0)
+
         modulated_x = x + alpha * global_signal
 
-        assert not torch.isnan(modulated_x).any(), f"[CrossAttentionModulation] 输出出现NaN！"
-        assert not torch.isinf(modulated_x).any(), f"[CrossAttentionModulation] 输出出现Inf！"
+        if torch.isnan(modulated_x).any() or torch.isinf(modulated_x).any():
+            return x.clone()
 
         return modulated_x
 
@@ -1360,13 +1370,13 @@ class PromptGenerator(nn.Module):
             )
             with torch.no_grad():
                 if layer_id in [1, 2, 3]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.5, 0.5, -1.0, -1.0])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -2.0, -2.0])
                 elif layer_id in [5, 6]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, 0.8, -1.0])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0, -2.0])
                 elif layer_id in [8, 9]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([-0.5, -0.5, -0.5, 0.8])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -2.0, 0.0])
                 else:
-                    self.layer_gates[str(layer_id)][-1].bias.data.zero_()
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0, 0.0])
 
     @property
     def total_prompt_len(self):
@@ -1805,10 +1815,10 @@ class PromptGenerator(nn.Module):
                 x_search = x_search + total_modulation
                 
                 intermediates['branch_feats'] = {
-                    'rgb_mean': rgb_feat.mean(dim=1).detach(),
-                    'tir_mean': tir_feat.mean(dim=1).detach(),
-                    'consistency_mean': consistency_prompt.mean(dim=1).detach() if consistency_prompt is not None else None,
-                    'temporal_mean': temporal_prompt.mean(dim=1).detach() if temporal_prompt is not None else None,
+                    'rgb_mean': rgb_feat.mean(dim=1),
+                    'tir_mean': tir_feat.mean(dim=1),
+                    'consistency_mean': consistency_prompt.mean(dim=1) if consistency_prompt is not None else None,
+                    'temporal_mean': temporal_prompt.mean(dim=1) if temporal_prompt is not None else None,
                 }
             
             return x_search, intermediates

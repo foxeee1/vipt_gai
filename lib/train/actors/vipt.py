@@ -42,31 +42,28 @@ class ViPTActor(BaseActor):
             meta_gen = net.backbone.meta_prompt_generator
             
             if stage == 1:
-                # Stage1：仅训练模态专属Prompt（低层1-3）+ 基础跟踪头
-                # 冻结Consistency、Temporal、Mask分支
                 for name, param in net.named_parameters():
                     if any(kw in name for kw in ['consistency_generator', 'temporal_generator', 
                                                    'mask_generator', 'cross_attn_modulation',
-                                                   'layer_gates', 'alpha_consistency', 
+                                                   'alpha_consistency', 
                                                    'alpha_temporal', 'alpha_mask']):
                         param.requires_grad = False
                     else:
                         param.requires_grad = True
-                print("[STAGE1] 模态专属Prompt可训练，Consistency/Temporal/Mask已冻结")
+                print("[STAGE1] 模态Prompt+门控+主干可训练，辅助生成器已冻结（门控不冻结！）")
             
             elif stage == 2:
-                # Stage2：冻结模态专属分支，训练Consistency+Temporal
                 for name, param in net.named_parameters():
                     if any(kw in name for kw in ['modality_prompt_proj', 'rgb_type_token', 'tir_type_token']):
                         param.requires_grad = False
                     elif any(kw in name for kw in ['consistency_generator', 'temporal_generator',
                                                     'mask_generator', 'cross_attn_modulation',
-                                                    'layer_gates', 'alpha_consistency',
+                                                    'alpha_consistency',
                                                     'alpha_temporal', 'alpha_mask']):
                         param.requires_grad = True
                     else:
                         param.requires_grad = True
-                print("[STAGE2] Consistency+Temporal+Mask可训练，模态专属已冻结")
+                print("[STAGE2] 辅助生成器+门控+主干可训练，模态Prompt已冻结")
             
             elif stage == 3:
                 # Stage3：解冻所有分支，联合微调

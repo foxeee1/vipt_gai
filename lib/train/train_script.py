@@ -278,6 +278,7 @@ def run(settings):
     settings.early_stop_patience = getattr(cfg.TRAIN, "EARLY_STOP_PATIENCE", 0)
 
     settings.cfg = cfg
+    settings.resume_checkpoint = getattr(settings, 'resume', None)
 
     # ==================== 第十二步：创建训练器 ====================
     # LTRTrainer 管理完整的训练循环
@@ -310,12 +311,11 @@ def run(settings):
         )
 
     # ==================== 第十三步：启动训练循环 ====================
-    # 训练参数：
-    # - cfg.TRAIN.EPOCH: 训练的总epoch数
-    # - load_latest: 是否加载最新的checkpoint继续训练
-    # - fail_safe: 是否启用故障安全（训练中断时保存checkpoint）
+    # resume_checkpoint: 从指定路径恢复训练（用于三阶段权重传递）
+    # load_latest: 是否从最新checkpoint恢复（仅当resume_checkpoint为None时生效）
     trainer.train(
         cfg.TRAIN.EPOCH,
-        load_latest=True,
-        fail_safe=True
+        load_latest=(settings.resume_checkpoint is None),
+        fail_safe=True,
+        resume_checkpoint=settings.resume_checkpoint
     )

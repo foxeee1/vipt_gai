@@ -192,10 +192,18 @@ def get_optimizer_scheduler(net, cfg):
             # else:
             #     print(n)
     else:
+        gate_lr = cfg.TRAIN.LR * getattr(cfg.TRAIN, 'GATE_LR_MULTIPLIER', 0.5)
         param_dicts = [
-            {"params": [p for n, p in net.named_parameters() if "backbone" not in n and p.requires_grad]},
+            {"params": [p for n, p in net.named_parameters() 
+                        if "backbone" not in n and "layer_gate" not in n and p.requires_grad]},
             {
-                "params": [p for n, p in net.named_parameters() if "backbone" in n and p.requires_grad],
+                "params": [p for n, p in net.named_parameters() 
+                           if "layer_gate" in n and p.requires_grad],
+                "lr": gate_lr,
+            },
+            {
+                "params": [p for n, p in net.named_parameters() 
+                           if "backbone" in n and "layer_gate" not in n and p.requires_grad],
                 "lr": cfg.TRAIN.LR * cfg.TRAIN.BACKBONE_MULTIPLIER,
             },
         ]

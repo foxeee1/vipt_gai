@@ -63,12 +63,14 @@ class BaseTrainer:
         else:
             self._checkpoint_dir = None
 
-    def train(self, max_epochs, load_latest=False, fail_safe=True, load_previous_ckpt=False, distill=False):
+    def train(self, max_epochs, load_latest=False, fail_safe=True, load_previous_ckpt=False, distill=False,
+              resume_checkpoint=None):
         """Do training for the given number of epochs.
         args:
             max_epochs - Max number of training epochs,
             load_latest - Bool indicating whether to resume from latest epoch.
             fail_safe - Bool indicating whether the training to automatically restart in case of any crashes.
+            resume_checkpoint - 显式指定checkpoint路径，用于三阶段权重传递
             _checkpoint_dir - output/checkpoints
         """
 
@@ -76,7 +78,9 @@ class BaseTrainer:
         num_tries = 1
         for i in range(num_tries):
             try:
-                if load_latest:
+                if resume_checkpoint is not None:
+                    self.load_checkpoint(resume_checkpoint)
+                elif load_latest:
                     self.load_checkpoint()
                 if load_previous_ckpt:
                     directory = '{}/{}'.format(self._checkpoint_dir, self.settings.project_path_prv)
