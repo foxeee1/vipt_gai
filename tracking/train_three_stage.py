@@ -47,6 +47,10 @@ def build_model_and_load_pretrain(cfg, settings):
 
 
 def apply_stage_freeze(net, stage):
+    # 【v25关键修复】统一冻结逻辑，确保与inject逻辑一致
+    # Stage1: 仅模态Prompt+layer_gates可训练（ViT主干冻结）
+    # Stage2: 仅辅助生成器+alpha可训练（ViT主干+模态Prompt冻结）
+    # Stage3: 所有Prompt+门控+生成器可训练（ViT主干冻结）
     for name, param in net.named_parameters():
         param.requires_grad = False
     
@@ -55,7 +59,7 @@ def apply_stage_freeze(net, stage):
             if any(kw in name for kw in ['rgb_prompt', 'tir_prompt', 'modality_prompt_proj',
                                           'rgb_type_token', 'tir_type_token', 'layer_gates']):
                 param.requires_grad = True
-        print(f"[Stage1] RGB/TIR模态Prompt + layer_gates可训练")
+        print(f"[Stage1] RGB/TIR模态Prompt + layer_gates可训练，ViT主干冻结")
     
     elif stage == 2:
         for name, param in net.named_parameters():
@@ -63,11 +67,14 @@ def apply_stage_freeze(net, stage):
                                           'mask_generator', 'cross_attn_modulation',
                                           'alpha_consistency', 'alpha_temporal', 'alpha_mask']):
                 param.requires_grad = True
-        print(f"[Stage2] 仅辅助生成器可训练，模态Prompt已冻结")
+        print(f"[Stage2] 仅辅助生成器可训练，模态Prompt+ViT主干冻结")
     
     elif stage == 3:
         for name, param in net.named_parameters():
-            if 'prompt' in name or 'layer_gate' in name or 'alpha_' in name or 'generator' in name:
+            if any(kw in name for kw in ['prompt', 'layer_gate', 'alpha_', 'generator',
+                                          'cross_attn_modulation', 'type_token',
+                                          'modality_prompt_proj', 'coop_gate',
+                                          'gated_fusion', 'gate_feat_proj']):
                 param.requires_grad = True
         print(f"[Stage3] 所有Prompt+门控+生成器可训练，ViT主干冻结")
     
@@ -137,7 +144,15 @@ def update_optimizer_for_stage(optimizer, net, stage, cfg):
         print(f"[Stage3优化器] Prompt LR={base_lr:.2e}, Gate LR={gate_lr:.2e}")
     
     optimizer.param_groups = new_param_groups
-    optimizer.state = defaultdict(dict)
+    # 【v25关键修复】不再清空optimizer.state
+    # 原问题：optimizer.state = defaultdict(dict) 丢失AdamW的一阶/二阶动量
+    # 修复：保留已有参数的动量，只添加新参数的空状态
+    # 新参数（之前未训练的）会自动获得空状态，已有参数保留动量
+    for group in new_param_groups:
+        for p in group['params']:
+            pid = id(p)
+            if pid not in optimizer.state:
+                optimizer.state[pid] = defaultdict(dict)
 
 
 def save_full_checkpoint(net, optimizer, lr_scheduler, epoch, best_iou, stage, save_path):
@@ -342,24 +357,9 @@ def main():
         print("                    Stage 2: 辅助分支训练")
         print("=" * 70)
         
-        def reinit_module(module):
-            for m in module.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-                elif isinstance(m, nn.LayerNorm):
-                    nn.init.ones_(m.weight)
-                    nn.init.zeros_(m.bias)
-        
-        if hasattr(net, 'module'):
-            meta_prompt = net.module.backbone.meta_prompt_generator
-        else:
-            meta_prompt = net.backbone.meta_prompt_generator
-        
-        if hasattr(meta_prompt, 'cross_attn_modulation') and meta_prompt.cross_attn_modulation is not None:
-            reinit_module(meta_prompt.cross_attn_modulation)
-            print("[Stage2] 已重新初始化 cross_attn_modulation")
+        # 【v25关键修复】不再重新初始化cross_attn_modulation
+        # 原问题：Stage2重新初始化会破坏Stage1学到的特征表示
+        # 修复：保留Stage1的权重，让辅助分支在已有特征空间上学习
         
         settings.config_name = 'stage2'
         settings.project_path = 'train/vipt/stage2'

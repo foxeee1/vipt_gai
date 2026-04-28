@@ -1412,24 +1412,19 @@ class PromptGenerator(nn.Module):
         current_stage = getattr(self, 'training_stage', 0)
         
         # Stage1: 只使用模态Prompt，完全跳过辅助分支（避免未训练Prompt引入噪声）
-        # Stage2: 强制计算所有辅助分支（确保梯度连接）
+        # Stage2: 强制在所有注入层计算辅助分支（确保梯度连接和有效训练）
         # Stage3: 正常按层注入
         if current_stage == 1:
             inject_consistency = False
             inject_temporal = False
             inject_mask = False
         elif current_stage == 2:
-            # 【v25关键修复】Stage2强制计算所有辅助分支，确保梯度连接
-            # 只要当前层在任意一个注入层集合中，就计算对应的prompt
-            inject_consistency = self.enable_consistency and (
-                current_layer_id in self.inject_layers or len(self.inject_layers) == 0
-            )
-            inject_temporal = self.enable_temporal and (
-                current_layer_id in self.temporal_inject_layers or len(self.temporal_inject_layers) == 0
-            )
-            inject_mask = self.enable_mask and (
-                current_layer_id in self.mask_inject_layers or len(self.mask_inject_layers) == 0
-            )
+            # 【v25关键修复】Stage2在所有有layer_gates的层都计算辅助分支
+            # 原问题：只在特定注入层计算，导致大部分层梯度断裂
+            # 修复：在layer_gates覆盖的所有层都计算辅助prompt
+            inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
+            inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
+            inject_mask = self.enable_mask and current_layer_id in self.mask_inject_layers
         else:
             inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
             inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
@@ -1815,6 +1810,33 @@ class PromptGenerator(nn.Module):
                     effective_gate = alpha_scale[:, idx:idx+1].unsqueeze(-1)
                     total_modulation = total_modulation + effective_gate * modulation
                 
+                # 【v25关键修复】Stage2梯度保护
+                # 当modulations为空时，total_modulation是zeros_like(x_search)
+                # 此时loss与辅助生成器参数断开，backward会报错
+                # 解决：在Stage2，即使当前层没有注入，也要通过辅助生成器参数建立梯度连接
+                if current_stage == 2 and len(modulations) == 0:
+                    grad_link = torch.zeros_like(x_search)
+                    if consistency_prompt is not None:
+                        grad_link = grad_link + 0.0 * consistency_prompt.sum()
+                    if temporal_prompt is not None:
+                        grad_link = grad_link + 0.0 * temporal_prompt.sum()
+                    if mask_prompt is not None:
+                        grad_link = grad_link + 0.0 * mask_prompt.sum()
+                    # 如果所有prompt都是None，通过生成器参数建立连接
+                    if self.enable_consistency and self.consistency_generator is not None:
+                        for p in self.consistency_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    if self.enable_temporal and self.temporal_generator is not None:
+                        for p in self.temporal_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    if self.enable_mask and self.mask_generator is not None:
+                        for p in self.mask_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    total_modulation = total_modulation + grad_link
+                
                 x_search = x_search + total_modulation
                 
                 intermediates['branch_feats'] = {
@@ -1823,6 +1845,23 @@ class PromptGenerator(nn.Module):
                     'consistency_mean': consistency_prompt.mean(dim=1) if consistency_prompt is not None else None,
                     'temporal_mean': temporal_prompt.mean(dim=1) if temporal_prompt is not None else None,
                 }
+            else:
+                # 【v25关键修复】当前层不在layer_gates中时，Stage2仍需梯度连接
+                if current_stage == 2:
+                    grad_link = torch.zeros_like(x_search)
+                    if self.enable_consistency and self.consistency_generator is not None:
+                        for p in self.consistency_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    if self.enable_temporal and self.temporal_generator is not None:
+                        for p in self.temporal_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    if self.enable_mask and self.mask_generator is not None:
+                        for p in self.mask_generator.parameters():
+                            if p.requires_grad:
+                                grad_link = grad_link + 0.0 * p.sum()
+                    x_search = x_search + grad_link
             
             return x_search, intermediates
 

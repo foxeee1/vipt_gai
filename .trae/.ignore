@@ -8,3 +8,9 @@ data/
 **/*.pt
 **/*.bin
 **/__pycache__/
+
+viz_quick/
+fenxi.txt/
+tensorboard/
+output/
+fenxi.txt/

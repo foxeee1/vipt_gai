@@ -28,7 +28,9 @@ class ViPTActor(BaseActor):
             self._apply_freeze_settings()
     
     def _apply_freeze_settings(self):
-        """三阶段训练：Stage1模态专属→Stage2一致性+时序→Stage3联合微调"""
+        # 【v25关键修复】删除此处的冻结逻辑，统一由train_three_stage.py的apply_stage_freeze控制
+        # 原问题：两套冻结逻辑互相矛盾，导致Stage2主干被意外解冻
+        # 现在只在此处做日志输出，不修改requires_grad
         net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
         
         stage = getattr(self.cfg.TRAIN, 'STAGE', 0)
@@ -36,40 +38,9 @@ class ViPTActor(BaseActor):
         if stage == 0:
             return
         
-        print(f"[三阶段训练] STAGE={stage}")
-        
-        if hasattr(net, 'backbone') and hasattr(net.backbone, 'meta_prompt_generator'):
-            meta_gen = net.backbone.meta_prompt_generator
-            
-            if stage == 1:
-                for name, param in net.named_parameters():
-                    if any(kw in name for kw in ['consistency_generator', 'temporal_generator', 
-                                                   'mask_generator', 'cross_attn_modulation',
-                                                   'alpha_consistency', 
-                                                   'alpha_temporal', 'alpha_mask']):
-                        param.requires_grad = False
-                    else:
-                        param.requires_grad = True
-                print("[STAGE1] 模态Prompt+门控+主干可训练，辅助生成器已冻结（门控不冻结！）")
-            
-            elif stage == 2:
-                for name, param in net.named_parameters():
-                    if any(kw in name for kw in ['modality_prompt_proj', 'rgb_type_token', 'tir_type_token']):
-                        param.requires_grad = False
-                    elif any(kw in name for kw in ['consistency_generator', 'temporal_generator',
-                                                    'mask_generator', 'cross_attn_modulation',
-                                                    'alpha_consistency',
-                                                    'alpha_temporal', 'alpha_mask']):
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = True
-                print("[STAGE2] 辅助生成器+门控+主干可训练，模态Prompt已冻结")
-            
-            elif stage == 3:
-                # Stage3：解冻所有分支，联合微调
-                for param in net.parameters():
-                    param.requires_grad = True
-                print("[STAGE3] 所有参数已解冻，联合微调")
+        trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in net.parameters())
+        print(f"[ViPTActor] STAGE={stage}, 可训练参数: {trainable:,}/{total:,} ({100*trainable/total:.1f}%) — 冻结由train_three_stage.py统一控制")
 
     def fix_bns(self):
         net = self.net.module if multigpu.is_multi_gpu(self.net) else self.net
