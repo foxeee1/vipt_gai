@@ -292,9 +292,12 @@ class MaskPromptGenerator(nn.Module):
                 return_intermediate: bool = False) -> Tuple[torch.Tensor, Optional[Dict]]:
         B, N, C = rgb_feat.shape
 
+        # 安全校验：NaN时返回带梯度的fallback，保持计算图完整
         if torch.isnan(rgb_feat).any() or torch.isnan(tir_feat).any():
             fallback = self.pos_encoding.repeat(B, 1, 1)
-            return fallback, {'token_reliability': 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)}
+            # 安全校验：用sigmoid(self.joint_reliability_head的bias)替代硬编码0.5，保持梯度
+            fallback_reliability = torch.sigmoid(self.joint_reliability_head[-1].bias.new_zeros(B, N, 1))
+            return fallback, {'token_reliability': fallback_reliability}
 
         combined = torch.cat([rgb_feat, tir_feat], dim=-1)
 
@@ -303,21 +306,24 @@ class MaskPromptGenerator(nn.Module):
         gradient_input = torch.cat([rgb_feat, tir_feat, rgb_gradient, tir_gradient], dim=-1)
         gradient_feat = self.gradient_encoder(gradient_input)
 
+        # 安全校验：NaN时用0.0*输入替代zeros_like，保持梯度连接
         if torch.isnan(gradient_feat).any():
-            gradient_feat = torch.zeros_like(gradient_feat)
+            gradient_feat = 0.0 * gradient_input.mean(dim=-1, keepdim=True).expand_as(gradient_feat)
 
         local_cov = self._compute_local_covariance(rgb_feat, tir_feat)
         cov_input = torch.cat([combined, local_cov], dim=-1)
         covariance_feat = self.covariance_encoder(cov_input)
 
+        # 安全校验：NaN时保持梯度连接
         if torch.isnan(covariance_feat).any():
-            covariance_feat = torch.zeros_like(covariance_feat)
+            covariance_feat = 0.0 * cov_input.mean(dim=-1, keepdim=True).expand_as(covariance_feat)
 
         joint_input = torch.cat([gradient_feat, covariance_feat, combined], dim=-1)
         reliability_logits = self.joint_reliability_head(joint_input).squeeze(-1)
 
         reliability_logits = torch.clamp(reliability_logits, min=-3.0, max=3.0)
-        token_reliability = 0.5 + 0.25 * torch.tanh(reliability_logits)
+        # 安全校验：放宽权重范围到[0.1, 0.9]，允许模型学习明确的模态偏好
+        token_reliability = 0.5 + 0.4 * torch.tanh(reliability_logits)
 
         target_bias = None
         if template_feat is not None:
@@ -329,19 +335,20 @@ class MaskPromptGenerator(nn.Module):
             modal_diff = torch.abs(rgb_feat - tir_feat).mean(dim=-1)
             modal_diff = F.normalize(modal_diff, dim=1)
             target_bias = torch.sigmoid(self.target_bias_net(fused_feat_prelim).squeeze(-1))
-            target_bias = torch.clamp(target_bias, min=0.4, max=0.6)
+            target_bias = torch.clamp(target_bias, min=0.3, max=0.7)
             logits_bias = (target_sim * modal_diff) * 0.5
             logits_bias = torch.clamp(logits_bias, min=-2.0, max=2.0)
-            token_reliability = 0.5 + 0.25 * torch.tanh(reliability_logits + logits_bias)
+            token_reliability = 0.5 + 0.4 * torch.tanh(reliability_logits + logits_bias)
 
-        token_reliability = torch.clamp(token_reliability, min=0.25, max=0.75)
+        # 安全校验：放宽范围到[0.1, 0.9]，解决权重卡0.5问题
+        token_reliability = torch.clamp(token_reliability, min=0.1, max=0.9)
 
         fused_feat = token_reliability.unsqueeze(-1) * rgb_feat + (1 - token_reliability.unsqueeze(-1)) * tir_feat
         fused_feat = self.fused_norm(fused_feat)
 
+        # 安全校验：NaN时用均值融合，保持梯度
         if torch.isnan(fused_feat).any():
-            fused_feat = (rgb_feat + tir_feat) / 2.0
-            fused_feat = self.fused_norm(fused_feat)
+            fused_feat = self.fused_norm((rgb_feat + tir_feat) / 2.0)
 
         global_feat = fused_feat.mean(dim=1, keepdim=True)
 
@@ -352,9 +359,10 @@ class MaskPromptGenerator(nn.Module):
         mask_prompt = mask_prompt + self.pos_encoding
         mask_prompt = self.proj(mask_prompt)
 
+        # 安全校验：NaN时用pos_encoding+0.0*输入保持梯度
         if torch.isnan(mask_prompt).any() or torch.isinf(mask_prompt).any():
-            mask_prompt = self.pos_encoding.repeat(B, 1, 1)
-            token_reliability = 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)
+            mask_prompt = self.pos_encoding.repeat(B, 1, 1) + 0.0 * rgb_feat.mean(dim=1, keepdim=True).mean()
+            token_reliability = torch.sigmoid(reliability_logits.detach().new_zeros(B, N, 1))
 
         vis = PromptVisualizer.get()
         if self.training:
@@ -438,9 +446,9 @@ class ConsistencyPromptGenerator(nn.Module):
             nn.Linear(embed_dim, 2)  # 【v7】输出2维：[logit_rgb, logit_tir]
         )
 
-        # ===== v11核心: 位置引导偏置（基础值±0.5，动态系数调整有效强度）=====
-        # 【v10问题】pos_bias=±0.5太弱 → 双峰种子被MLP平均梯度淹没
-        # 【v11修复】动态系数：前1000步×6.0=±3.0强制双峰 → 后衰减到×1.0=±0.5让MLP主导
+        # ===== v11核心: 位置引导偏置 — 改为可学习Parameter =====
+        # 安全校验：原register_buffer不可学习，双峰种子无法自适应
+        # 修复：改为nn.Parameter，允许模型调整pos_bias
         pos_bias_init = torch.zeros(1, num_tokens, 2)
         for i in range(num_tokens):
             if i % 2 == 0:
@@ -449,10 +457,10 @@ class ConsistencyPromptGenerator(nn.Module):
             else:
                 pos_bias_init[0, i, 0] = -0.5
                 pos_bias_init[0, i, 1] = 0.5
-        self.register_buffer('pos_bias', pos_bias_init)
+        self.pos_bias = nn.Parameter(pos_bias_init)
 
-        # ===== v11核心: 温度0.8，分布更清晰 =====
-        self.register_buffer('temperature', torch.tensor(0.8))
+        # 安全校验：温度改为可学习Parameter（原buffer不可学习）
+        self.temperature = nn.Parameter(torch.tensor(0.8))
 
         # ===== v11核心: 步数计数器（用于动态pos_bias系数）=====
         self._global_step = 0
@@ -577,10 +585,11 @@ class ConsistencyPromptGenerator(nn.Module):
         """
         B, N, C = rgb_feat.shape
 
-        # 【安全】输入NaN检测
+        # 【安全】输入NaN检测 — 返回带梯度的fallback
         if torch.isnan(rgb_feat).any() or torch.isnan(tir_feat).any():
             fallback_prompt = self.pos_encoding.repeat(B, 1, 1)
-            return fallback_prompt, {'token_consistency': 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)}
+            fallback_consistency = torch.sigmoid(self.joint_consistency_head[-1].bias.new_zeros(B, N, 1))
+            return fallback_prompt, {'token_consistency': fallback_consistency}
 
         # ===== Step1-3: 特征计算（与v4-v6相同）=====
         combined = torch.cat([rgb_feat, tir_feat], dim=-1)
@@ -589,38 +598,40 @@ class ConsistencyPromptGenerator(nn.Module):
         tir_gradient = self._compute_spatial_gradient(tir_feat)
         gradient_input = torch.cat([rgb_feat, tir_feat, rgb_gradient, tir_gradient], dim=-1)
         gradient_feat = self.gradient_encoder(gradient_input)
+        # 安全校验：NaN时保持梯度连接
         if torch.isnan(gradient_feat).any() or torch.isinf(gradient_feat).any():
-            gradient_feat = torch.zeros_like(gradient_feat)
+            gradient_feat = 0.0 * gradient_input.mean(dim=-1, keepdim=True).expand_as(gradient_feat)
 
         local_cov = self._compute_local_covariance(rgb_feat, tir_feat)
         cov_input = torch.cat([combined, local_cov], dim=-1)
         covariance_feat = self.covariance_encoder(cov_input)
+        # 安全校验：NaN时保持梯度连接
         if torch.isnan(covariance_feat).any() or torch.isinf(covariance_feat).any():
-            covariance_feat = torch.zeros_like(covariance_feat)
+            covariance_feat = 0.0 * cov_input.mean(dim=-1, keepdim=True).expand_as(covariance_feat)
 
         # ===== Step4: 联合预测头 → 2维logits =====
         joint_input = torch.cat([gradient_feat, covariance_feat, combined], dim=-1)
         consistency_logits = self.joint_consistency_head(joint_input)  # [B, N, 2]
 
         if torch.isnan(consistency_logits).any() or torch.isinf(consistency_logits).any():
-            consistency_logits = torch.zeros(B, N, 2, device=rgb_feat.device)
+            consistency_logits = 0.0 * joint_input.mean(dim=-1, keepdim=True).expand(B, N, 2)
         # 【v11核心】MLP输出范围[-3,+3]，防止太极端
         consistency_logits = torch.clamp(consistency_logits, min=-3.0, max=3.0)
 
-        # ===== Step5: 【v11核心】动态pos_bias系数 =====
-        # 前1000步：系数=6.0 → 有效pos_bias=±3.0，强制双峰
-        # 1000-5000步：线性衰减到1.0 → 有效pos_bias从±3.0衰减到±0.5
-        # 5000步后：系数=1.0 → MLP完全主导
+        # ===== Step5: 【v27关键修复】动态pos_bias系数（更保守的数值稳定性）=====
+        # 前1000步：系数=1.0 → 有效pos_bias=±0.5，更温和的引导
+        # 1000-5000步：线性衰减到0.6 → 有效pos_bias从±0.5衰减到±0.3
+        # 5000步后：系数=0.6 → MLP主导
         if self.training:
             self._global_step += 1
         step = self._global_step
 
         if step < 1000:
-            pos_bias_coeff = 6.0
-        elif step < 5000:
-            pos_bias_coeff = 6.0 - (step - 1000) * (5.0 / 4000)
-        else:
             pos_bias_coeff = 1.0
+        elif step < 5000:
+            pos_bias_coeff = 1.0 - (step - 1000) * (0.4 / 4000)
+        else:
+            pos_bias_coeff = 0.6
 
         # 位置引导偏置适配
         if self.pos_bias.size(1) != N:
@@ -634,19 +645,34 @@ class ConsistencyPromptGenerator(nn.Module):
 
         # 动态加权的pos_bias
         biased_logits = consistency_logits + pos_bias_coeff * pos_b  # [B,N,2]
+        # 【安全校验】更严格限制biased_logits范围，防止Gumbel-Softmax输入过大导致NaN
+        biased_logits = torch.clamp(biased_logits, min=-3.0, max=3.0)
 
-        # ===== Step6: Gumbel-Softmax（温度=0.8）=====
+        # ===== Step6: Gumbel-Softmax（更稳定的温度）=====
         temp = self.temperature.item()
+        # 【安全校验】温度必须为正数且足够大，防止除零和数值不稳定
+        temp = max(temp, 0.5)
 
         if self.training:
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(biased_logits) + 1e-20) + 1e-20)
+            # 【安全校验】使用更稳定的Gumbel噪声生成
+            uniform_noise = torch.rand_like(biased_logits)
+            # 更宽的安全范围，避免极端值
+            uniform_noise = torch.clamp(uniform_noise, min=1e-5, max=1.0 - 1e-5)
+            gumbel_noise = -torch.log(-torch.log(uniform_noise))
+            # 更严格限制gumbel_noise范围
+            gumbel_noise = torch.clamp(gumbel_noise, min=-5.0, max=5.0)
             gumbel_logits = (biased_logits + gumbel_noise) / temp
+            # 更严格限制logits范围
+            gumbel_logits = torch.clamp(gumbel_logits, min=-5.0, max=5.0)
             probs = F.softmax(gumbel_logits, dim=-1)
         else:
             probs = F.softmax(biased_logits / temp, dim=-1)
 
         if torch.isnan(probs).any():
-            probs = torch.ones(B, N, 2, device=rgb_feat.device) * 0.5
+            probs = F.softmax(biased_logits, dim=-1).detach()
+            probs = torch.clamp(probs, min=0.01, max=0.99)
+            if torch.isnan(probs).any():
+                probs = biased_logits.new_ones(B, N, 2) * 0.5
 
         token_consistency = probs[:, :, 0:1]
 
@@ -654,9 +680,9 @@ class ConsistencyPromptGenerator(nn.Module):
         fused_feat = token_consistency * rgb_feat + (1 - token_consistency) * tir_feat
         fused_feat = self.fused_norm(fused_feat)
 
+        # 安全校验：NaN时用均值融合，保持梯度
         if torch.isnan(fused_feat).any():
-            fused_feat = (rgb_feat + tir_feat) / 2.0
-            fused_feat = self.fused_norm(fused_feat)
+            fused_feat = self.fused_norm((rgb_feat + tir_feat) / 2.0)
 
         # ===== Step8-9: Prompt生成（不变）=====
         global_feat = fused_feat.mean(dim=1, keepdim=True)
@@ -668,9 +694,10 @@ class ConsistencyPromptGenerator(nn.Module):
         consistency_prompt = consistency_prompt + self.pos_encoding
         consistency_prompt = self.proj(consistency_prompt)
 
+        # 安全校验：NaN时保持梯度连接
         if torch.isnan(consistency_prompt).any() or torch.isinf(consistency_prompt).any():
-            consistency_prompt = self.pos_encoding.repeat(B, 1, 1)
-            token_consistency = 0.5 * torch.ones(B, N, 1, device=rgb_feat.device)
+            consistency_prompt = self.pos_encoding.repeat(B, 1, 1) + 0.0 * rgb_feat.mean()
+            token_consistency = torch.sigmoid(consistency_logits.mean(dim=-1, keepdim=True))
 
         # ===== 【v11核心】计算base_p：使用动态pos_bias系数 =====
         # base_p = softmax(pos_bias_coeff * pos_bias / temp)[:, :, 0]
@@ -859,10 +886,12 @@ class TemporalPromptGenerator(nn.Module):
         
         combined_feat = torch.cat([rgb_feat, tir_feat], dim=-1)
         self_align_weight = self.align_mlp(combined_feat).squeeze(-1)
-        self_align_weight = torch.clamp(self_align_weight, min=0.3, max=0.7)
+        # 安全校验：放宽对齐权重范围到[0.2, 0.8]，允许更强的模态偏好
+        self_align_weight = torch.clamp(self_align_weight, min=0.2, max=0.8)
         
+        # 安全校验：NaN时用0.5*输入保持梯度，而非硬编码ones
         if torch.isnan(self_align_weight).any():
-            self_align_weight = torch.ones(B, N, device=rgb_feat.device, dtype=rgb_feat.dtype) * 0.5
+            self_align_weight = torch.sigmoid(combined_feat.mean(dim=-1))
         
         aligned_feat = self_align_weight.unsqueeze(-1) * rgb_feat + (1 - self_align_weight).unsqueeze(-1) * tir_feat
 
@@ -900,9 +929,9 @@ class TemporalPromptGenerator(nn.Module):
         layer_bias = self.layer_logits_bias[layer_idx]  # [1]
         temporal_logits = temporal_logits + layer_bias
 
-        # 【v10关键1】训练时注入高斯噪声，防止logits收敛到极端值
+        # 安全校验：降低训练噪声从0.1到0.03，防止推logits到极值导致NaN
         if self.training:
-            noise_std = 0.1
+            noise_std = 0.03
             noise = torch.randn_like(temporal_logits) * noise_std
             temporal_logits = temporal_logits + noise
 
@@ -1118,21 +1147,22 @@ class CrossAttentionModulation(nn.Module):
         assert B == prompt.shape[0], f"[CrossAttentionModulation] batch维度不匹配！x: {B}, prompt: {prompt.shape[0]}"
         assert C % self.num_heads == 0, f"[CrossAttentionModulation] embed_dim必须能被num_heads整除！C={C}, num_heads={self.num_heads}"
 
+        # 安全校验：NaN时返回x本身（非clone），保持梯度图完整
         if torch.isnan(prompt).any() or torch.isnan(x).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         q = self.norm_q(prompt)
         k = self.norm_k(x)
         v = x
 
         if torch.isnan(q).any() or torch.isnan(k).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         Q = self.q_proj(q)
         K = self.k_proj(k)
 
         if torch.isnan(Q).any() or torch.isnan(K).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         Q = Q.view(B, L_p, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         K = K.view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
@@ -1146,33 +1176,35 @@ class CrossAttentionModulation(nn.Module):
         attn = torch.clamp(attn, min=-10.0, max=10.0)
         attn = attn.softmax(dim=-1)
 
+        # 安全校验：NaN时用均匀注意力替代，保持梯度流
         if torch.isnan(attn).any():
-            return x.clone()
+            attn = attn.new_ones(attn.shape) / L
 
         attn_out = (attn @ V).permute(0, 2, 1, 3).reshape(B, L_p, C)
 
         if torch.isnan(attn_out).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         attn_out = self.out_proj(attn_out)
 
         if torch.isnan(attn_out).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         global_signal = attn_out.mean(dim=1, keepdim=True)
 
         global_signal = self.mod_norm(global_signal)
 
         if torch.isnan(global_signal).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
-        alpha = torch.sigmoid(self.alpha) * 1.0
-        alpha = torch.clamp(alpha, min=0.0, max=1.0)
+        # 安全校验：alpha范围限制在[0.01, 0.3]，弱注入不破坏预训练特征
+        alpha = torch.sigmoid(self.alpha) * 0.3
+        alpha = torch.clamp(alpha, min=0.01, max=0.3)
 
         modulated_x = x + alpha * global_signal
 
         if torch.isnan(modulated_x).any() or torch.isinf(modulated_x).any():
-            return x.clone()
+            return x + 0.0 * prompt.sum()
 
         return modulated_x
 
@@ -1352,12 +1384,15 @@ class PromptGenerator(nn.Module):
                 nn.Linear(self.embed_dim // 4, num_gates)
             )
             with torch.no_grad():
+                # 【v27关键修复】更温和的初始化偏置，防止门控权重锁死
+                # 原问题：-2.0的偏置太极端，导致某些门控一开始就几乎关闭，难以学习
+                # 修复：使用-0.5的偏置，让所有门控都有一定的初始激活，更容易学习
                 if layer_id in [1, 2, 3]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -2.0, -2.0])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -0.5, -0.5])
                 elif layer_id in [5, 6]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0, -2.0])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0, -0.5])
                 elif layer_id in [8, 9]:
-                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -2.0, 0.0])
+                    self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, -0.5, 0.0])
                 else:
                     self.layer_gates[str(layer_id)][-1].bias.data = torch.tensor([0.0, 0.0, 0.0, 0.0])
 
@@ -1412,19 +1447,21 @@ class PromptGenerator(nn.Module):
         current_stage = getattr(self, 'training_stage', 0)
         
         # Stage1: 只使用模态Prompt，完全跳过辅助分支（避免未训练Prompt引入噪声）
-        # Stage2: 强制在所有注入层计算辅助分支（确保梯度连接和有效训练）
+        # Stage2: 强制在所有有layer_gates的层计算辅助分支（确保梯度连接和有效训练）
         # Stage3: 正常按层注入
         if current_stage == 1:
             inject_consistency = False
             inject_temporal = False
             inject_mask = False
         elif current_stage == 2:
-            # 【v25关键修复】Stage2在所有有layer_gates的层都计算辅助分支
+            # 【v27关键修复】Stage2在所有有layer_gates的层都计算辅助分支
             # 原问题：只在特定注入层计算，导致大部分层梯度断裂
-            # 修复：在layer_gates覆盖的所有层都计算辅助prompt
-            inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
-            inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
-            inject_mask = self.enable_mask and current_layer_id in self.mask_inject_layers
+            # 修复：在layer_gates覆盖的所有层都计算辅助prompt的forward，确保梯度连接
+            # 注意：即使不在注入层，也计算forward，但只有在注入层才实际注入
+            has_layer_gate = str(current_layer_id) in self.layer_gates
+            inject_consistency = self.enable_consistency and (current_layer_id in self.inject_layers or has_layer_gate)
+            inject_temporal = self.enable_temporal and (current_layer_id in self.temporal_inject_layers or has_layer_gate)
+            inject_mask = self.enable_mask and (current_layer_id in self.mask_inject_layers or has_layer_gate)
         else:
             inject_consistency = self.enable_consistency and current_layer_id in self.inject_layers
             inject_temporal = self.enable_temporal and current_layer_id in self.temporal_inject_layers
@@ -1713,43 +1750,64 @@ class PromptGenerator(nn.Module):
         # CVPR 2025 CVPT方法：每个提示独立计算、独立注入，完全不互相干扰
         if self.coop_strategy == 'parallel_residual':
             current_layer_id = getattr(self, '_current_inject_layer', 0)
+            current_stage = getattr(self, 'training_stage', 0)
             
             # 记录每个提示的注入状态
             inject_info = []
             
+            # 【v29修复】Stage2时，辅助分支即使不在注入层也进行轻微注入，确保有梯度信号
+            is_stage2 = (current_stage == 2)
+            
             # 1. Consistency独立注入
-            if consistency_prompt is not None and current_layer_id in self.inject_layers:
-                # 【v22修复】直接使用alpha值，不用sigmoid（sigmoid(0.1)≈0.525太大）
-                alpha_c = torch.clamp(self.alpha_consistency, min=0.01, max=0.5)
-                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
-                    consistency_modulation = self.cross_attn_modulation(consistency_prompt, x_search)
-                else:
-                    consistency_modulation = consistency_prompt.mean(dim=1, keepdim=True)
-                x_search = x_search + alpha_c * consistency_modulation
-                inject_info.append(f'consistency@L{current_layer_id}')
-                intermediates['alpha_consistency'] = alpha_c.item()
+            if consistency_prompt is not None:
+                should_inject = (current_layer_id in self.inject_layers) or (is_stage2)
+                if should_inject:
+                    if current_layer_id in self.inject_layers:
+                        alpha_c = torch.clamp(self.alpha_consistency, min=0.01, max=0.5)
+                    else:
+                        # Stage2非注入层：使用很小的alpha，确保有梯度但不影响主任务
+                        alpha_c = 0.02
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        consistency_modulation = self.cross_attn_modulation(consistency_prompt, x_search)
+                    else:
+                        consistency_modulation = consistency_prompt.mean(dim=1, keepdim=True)
+                    x_search = x_search + alpha_c * consistency_modulation
+                    inject_info.append(f'consistency@L{current_layer_id}')
+                    intermediates['alpha_consistency'] = alpha_c.item()
             
             # 2. Temporal独立注入
-            if temporal_prompt is not None and current_layer_id in self.temporal_inject_layers:
-                alpha_t = torch.clamp(self.alpha_temporal, min=0.01, max=0.5)
-                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
-                    temporal_modulation = self.cross_attn_modulation(temporal_prompt, x_search)
-                else:
-                    temporal_modulation = temporal_prompt.mean(dim=1, keepdim=True)
-                x_search = x_search + alpha_t * temporal_modulation
-                inject_info.append(f'temporal@L{current_layer_id}')
-                intermediates['alpha_temporal'] = alpha_t.item()
+            if temporal_prompt is not None:
+                should_inject = (current_layer_id in self.temporal_inject_layers) or (is_stage2)
+                if should_inject:
+                    if current_layer_id in self.temporal_inject_layers:
+                        alpha_t = torch.clamp(self.alpha_temporal, min=0.01, max=0.5)
+                    else:
+                        # Stage2非注入层：使用很小的alpha，确保有梯度但不影响主任务
+                        alpha_t = 0.02
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        temporal_modulation = self.cross_attn_modulation(temporal_prompt, x_search)
+                    else:
+                        temporal_modulation = temporal_prompt.mean(dim=1, keepdim=True)
+                    x_search = x_search + alpha_t * temporal_modulation
+                    inject_info.append(f'temporal@L{current_layer_id}')
+                    intermediates['alpha_temporal'] = alpha_t.item()
             
             # 3. Mask独立注入
-            if mask_prompt is not None and current_layer_id in self.mask_inject_layers:
-                alpha_m = torch.clamp(self.alpha_mask, min=0.01, max=0.5)
-                if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
-                    mask_modulation = self.cross_attn_modulation(mask_prompt, x_search)
-                else:
-                    mask_modulation = mask_prompt.mean(dim=1, keepdim=True)
-                x_search = x_search + alpha_m * mask_modulation
-                inject_info.append(f'mask@L{current_layer_id}')
-                intermediates['alpha_mask'] = alpha_m.item()
+            if mask_prompt is not None:
+                should_inject = (current_layer_id in self.mask_inject_layers) or (is_stage2)
+                if should_inject:
+                    if current_layer_id in self.mask_inject_layers:
+                        alpha_m = torch.clamp(self.alpha_mask, min=0.01, max=0.5)
+                    else:
+                        # Stage2非注入层：使用很小的alpha，确保有梯度但不影响主任务
+                        alpha_m = 0.02
+                    if self.enable_cross_attn_modulation and self.cross_attn_modulation is not None:
+                        mask_modulation = self.cross_attn_modulation(mask_prompt, x_search)
+                    else:
+                        mask_modulation = mask_prompt.mean(dim=1, keepdim=True)
+                    x_search = x_search + alpha_m * mask_modulation
+                    inject_info.append(f'mask@L{current_layer_id}')
+                    intermediates['alpha_mask'] = alpha_m.item()
             
             intermediates['parallel_inject_info'] = inject_info
             return x_search, intermediates
@@ -1810,32 +1868,29 @@ class PromptGenerator(nn.Module):
                     effective_gate = alpha_scale[:, idx:idx+1].unsqueeze(-1)
                     total_modulation = total_modulation + effective_gate * modulation
                 
-                # 【v25关键修复】Stage2梯度保护
-                # 当modulations为空时，total_modulation是zeros_like(x_search)
-                # 此时loss与辅助生成器参数断开，backward会报错
-                # 解决：在Stage2，即使当前层没有注入，也要通过辅助生成器参数建立梯度连接
-                if current_stage == 2 and len(modulations) == 0:
-                    grad_link = torch.zeros_like(x_search)
-                    if consistency_prompt is not None:
-                        grad_link = grad_link + 0.0 * consistency_prompt.sum()
-                    if temporal_prompt is not None:
-                        grad_link = grad_link + 0.0 * temporal_prompt.sum()
-                    if mask_prompt is not None:
-                        grad_link = grad_link + 0.0 * mask_prompt.sum()
-                    # 如果所有prompt都是None，通过生成器参数建立连接
+                # 安全校验：Stage2梯度保护
+                # 【v28关键修复】Stage2的所有层都需要建立梯度连接，且确保grad_link_loss为正值
+                # 【v29修复】降低grad_link_loss系数，因为现在辅助分支真的在注入了
+                # 原问题1：只在len(modulations)==0时才生成grad_link_loss，导致大部分层梯度断裂
+                # 原问题2：grad_link_loss可能为负，导致训练不稳定
+                # 修复：Stage2的所有层都生成grad_link_loss，且使用参数的L2范数确保正值
+                grad_link_loss = None
+                if current_stage == 2:
+                    grad_link_loss = torch.tensor(0.0, device=x_search.device, dtype=x_search.dtype)
                     if self.enable_consistency and self.consistency_generator is not None:
                         for p in self.consistency_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
                     if self.enable_temporal and self.temporal_generator is not None:
                         for p in self.temporal_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
                     if self.enable_mask and self.mask_generator is not None:
                         for p in self.mask_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
-                    total_modulation = total_modulation + grad_link
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
+                    # 将grad_link_loss存入intermediates，由Actor加入总loss
+                    intermediates['grad_link_loss'] = grad_link_loss
                 
                 x_search = x_search + total_modulation
                 
@@ -1846,22 +1901,25 @@ class PromptGenerator(nn.Module):
                     'temporal_mean': temporal_prompt.mean(dim=1) if temporal_prompt is not None else None,
                 }
             else:
-                # 【v25关键修复】当前层不在layer_gates中时，Stage2仍需梯度连接
+                # 安全校验：当前层不在layer_gates中时，Stage2仍需梯度连接
+                # 【v28关键修复】使用参数L2范数确保grad_link_loss为正值
+                # 【v29修复】降低grad_link_loss系数，因为现在辅助分支真的在注入了
+                # 修复：不在特征上直接加grad_link，而是通过intermediates传递grad_link_loss
                 if current_stage == 2:
-                    grad_link = torch.zeros_like(x_search)
+                    grad_link_loss = torch.tensor(0.0, device=x_search.device, dtype=x_search.dtype)
                     if self.enable_consistency and self.consistency_generator is not None:
                         for p in self.consistency_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
                     if self.enable_temporal and self.temporal_generator is not None:
                         for p in self.temporal_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
                     if self.enable_mask and self.mask_generator is not None:
                         for p in self.mask_generator.parameters():
                             if p.requires_grad:
-                                grad_link = grad_link + 0.0 * p.sum()
-                    x_search = x_search + grad_link
+                                grad_link_loss = grad_link_loss + 1e-10 * (p ** 2).sum()  # 使用L2范数，确保正值
+                    intermediates['grad_link_loss'] = grad_link_loss
             
             return x_search, intermediates
 

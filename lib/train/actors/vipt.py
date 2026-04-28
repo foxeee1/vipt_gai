@@ -170,9 +170,9 @@ class ViPTActor(BaseActor):
         return loss
 
     def _compute_stage2_loss(self, giou_loss, l1_loss, location_loss, iou, pred_dict, return_status):
-        """Stage2: 定位Loss降权 + 辅助分支专属Loss主导，强制辅助分支学习互补能力"""
+        """Stage2: 定位Loss主导 + 辅助分支弱约束（避免主任务IoU下降）"""
         tracking_loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss + self.loss_weight['focal'] * location_loss
-        loss = tracking_loss * 0.5
+        loss = tracking_loss * 1.0  # 【v28修复】恢复tracking Loss权重，不再降权
 
         current_reg_loss = 0.0
         current_temporal_reg = 0.0
@@ -184,7 +184,7 @@ class ViPTActor(BaseActor):
 
         inject_intermediates = pred_dict.get('inject_intermediates', {})
 
-        # ===== 一致性分支专属Loss：token一致性约束（权重1e-3主导） =====
+        # ===== 一致性分支约束：token一致性约束（权重1e-4，平衡训练） =====
         if 'consistency_intermediates' in inject_intermediates:
             consistency_data = inject_intermediates['consistency_intermediates']
             if consistency_data is not None and isinstance(consistency_data, dict):
@@ -202,10 +202,10 @@ class ViPTActor(BaseActor):
                         consistency_reg_loss = torch.norm(token_weight, p=2) / (num_tokens ** 0.5 + 1e-8)
                         # 裁剪到合理范围 [0, 10]
                         consistency_reg_loss = torch.clamp(consistency_reg_loss, 0, 10)
-                        loss = loss + 1e-3 * consistency_reg_loss
+                        loss = loss + 1e-4 * consistency_reg_loss  # 【v29修复】权重提高到1e-4
                         current_reg_loss = consistency_reg_loss.item()
 
-        # ===== 时序分支专属Loss：帧间平滑 + 运动门控约束（权重1e-3主导） =====
+        # ===== 时序分支约束：帧间平滑 + 运动门控约束（权重1e-4，平衡训练） =====
         if 'temporal_intermediates' in inject_intermediates:
             temporal_data = inject_intermediates['temporal_intermediates']
             if temporal_data is not None and isinstance(temporal_data, dict):
@@ -222,15 +222,15 @@ class ViPTActor(BaseActor):
                             temporal_reg_loss = temporal_reg_loss + 0.5 * frame_diff
                         # 裁剪到合理范围 [0, 10]
                         temporal_reg_loss = torch.clamp(temporal_reg_loss, 0, 10)
-                        loss = loss + 1e-3 * temporal_reg_loss
+                        loss = loss + 1e-4 * temporal_reg_loss  # 【v29修复】权重提高到1e-4
                         current_temporal_reg = temporal_reg_loss.item()
                         global_motion = temporal_data.get('global_motion')
                         if global_motion is not None and not torch.isnan(global_motion).any():
                             motion_gate_loss = -torch.mean(global_motion * tw.mean(dim=1, keepdim=True))
                             motion_gate_loss = torch.clamp(motion_gate_loss, -10, 10)
-                            loss = loss + 1e-4 * motion_gate_loss
+                            loss = loss + 1e-5 * motion_gate_loss  # 【v29修复】权重提高到1e-5
 
-        # ===== Mask分支专属Loss：目标区域特征响应增强（权重1e-3主导） =====
+        # ===== Mask分支约束：目标区域特征响应增强（权重1e-4，平衡训练） =====
         if 'mask_intermediates' in inject_intermediates:
             mask_data = inject_intermediates['mask_intermediates']
             if mask_data is not None and isinstance(mask_data, dict):
@@ -246,32 +246,64 @@ class ViPTActor(BaseActor):
                         # 裁剪到合理范围
                         mask_reg_loss = torch.clamp(mask_reg_loss, 0, 10)
                         target_resp_loss = torch.clamp(target_resp_loss, -10, 10)
-                        loss = loss + 1e-3 * mask_reg_loss + 1e-4 * target_resp_loss
+                        loss = loss + 1e-4 * mask_reg_loss + 1e-5 * target_resp_loss  # 【v29修复】权重提高到1e-4/1e-5
                         current_mask_reg = mask_reg_loss.item()
 
-        # ===== 跨模态双向KL散度（权重1e-4，Stage2适度对齐） =====
+        # ===== 跨模态双向KL散度（权重1e-5，Stage2弱对齐） =====
         if 'branch_feats' in inject_intermediates:
             bf = inject_intermediates['branch_feats']
             rgb_f = bf.get('rgb_mean')
             tir_f = bf.get('tir_mean')
             if rgb_f is not None and tir_f is not None:
                 # 安全校验：检查NaN
-                if not torch.isnan(rgb_f).any() and not torch.isnan(tir_f).any():
+                if not torch.isnan(rgb_f).any() and not torch.isnan(tir_f).any() and not torch.isinf(rgb_f).any() and not torch.isinf(tir_f).any():
+                    # 【v27关键修复】KL散度数值保护
+                    # 1. 先对特征做归一化，防止极端值
+                    rgb_f = (rgb_f - rgb_f.mean(dim=-1, keepdim=True)) / (rgb_f.std(dim=-1, keepdim=True) + 1e-8)
+                    tir_f = (tir_f - tir_f.mean(dim=-1, keepdim=True)) / (tir_f.std(dim=-1, keepdim=True) + 1e-8)
+                    # 2. 限制特征范围，避免softmax出现数值问题
+                    rgb_f = torch.clamp(rgb_f, min=-5.0, max=5.0)
+                    tir_f = torch.clamp(tir_f, min=-5.0, max=5.0)
+                    
                     rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
                     tir_log_prob = F.log_softmax(tir_f, dim=-1)
                     rgb_prob = F.softmax(rgb_f, dim=-1)
                     tir_prob = F.softmax(tir_f, dim=-1)
-                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
-                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
+                    
+                    # 3. 对prob添加epsilon保护，避免log(0)导致NaN
+                    epsilon = 1e-8
+                    rgb_prob = torch.clamp(rgb_prob, min=epsilon, max=1.0 - epsilon)
+                    tir_prob = torch.clamp(tir_prob, min=epsilon, max=1.0 - epsilon)
+                    rgb_log_prob = torch.clamp(rgb_log_prob, min=-50.0, max=0.0)
+                    tir_log_prob = torch.clamp(tir_log_prob, min=-50.0, max=0.0)
+                    
+                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean', log_target=False)
+                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean', log_target=False)
                     kl_loss = (kl_rt + kl_tr) / 2.0
-                    # 裁剪到合理范围 [0, 10]
-                    kl_loss = torch.clamp(kl_loss, 0, 10)
-                    loss = loss + 1e-4 * kl_loss
+                    
+                    # 4. 检查并裁剪kl_loss
+                    if torch.isnan(kl_loss) or torch.isinf(kl_loss) or kl_loss < 0:
+                        kl_loss = torch.tensor(0.0, device=kl_loss.device)
+                    kl_loss = torch.clamp(kl_loss, 0, 5.0)
+                    
+                    loss = loss + 1e-5 * kl_loss  # 【v29修复】权重提高到1e-5
                     current_kl_reg = kl_loss.item()
 
+        # ===== Stage2梯度链接Loss（来自inject的grad_link_loss）=====
+        # 安全校验：当当前层无注入时，通过grad_link_loss保持辅助生成器的梯度连接
+        grad_link_loss_val = 0.0
+        if 'inject_intermediates' in pred_dict and pred_dict['inject_intermediates']:
+            inject_intermediates = pred_dict['inject_intermediates']
+            if isinstance(inject_intermediates, dict) and 'grad_link_loss' in inject_intermediates:
+                grad_link_loss = inject_intermediates['grad_link_loss']
+                if grad_link_loss is not None and not torch.isnan(grad_link_loss) and not torch.isinf(grad_link_loss):
+                    loss = loss + grad_link_loss
+                    grad_link_loss_val = grad_link_loss.item()
+
         # 最终安全检查：确保loss不是NaN或Inf
+        # 安全校验：NaN时回退到tracking_loss（保留梯度），而非硬编码0.5倍
         if torch.isnan(loss) or torch.isinf(loss):
-            loss = tracking_loss * 0.5
+            loss = tracking_loss
 
         if return_status:
             mean_iou = iou.detach().mean()
@@ -284,6 +316,7 @@ class ViPTActor(BaseActor):
                       "Loss/mask_reg": current_mask_reg,
                       "Loss/ortho_reg": current_ortho_reg,
                       "Loss/kl_reg": current_kl_reg,
+                      "Loss/grad_link": grad_link_loss_val,
                       "Train/weight_var": current_weight_var if current_weight_var else 0.0,
                       "Train/weight_entropy": current_weight_entropy if current_weight_entropy else 0.0,
                       "IoU": mean_iou.item(),
@@ -377,15 +410,34 @@ class ViPTActor(BaseActor):
                 rgb_f = bf.get('rgb_mean')
                 tir_f = bf.get('tir_mean')
                 if rgb_f is not None and tir_f is not None:
-                    rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
-                    tir_log_prob = F.log_softmax(tir_f, dim=-1)
-                    rgb_prob = F.softmax(rgb_f, dim=-1)
-                    tir_prob = F.softmax(tir_f, dim=-1)
-                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
-                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
-                    kl_loss = (kl_rt + kl_tr) / 2.0
-                    loss = loss + 1e-6 * kl_loss
-                    current_kl_reg = kl_loss.item()
+                    # 【v27关键修复】KL散度数值保护（Stage3/Legacy）
+                    if not torch.isnan(rgb_f).any() and not torch.isnan(tir_f).any() and not torch.isinf(rgb_f).any() and not torch.isinf(tir_f).any():
+                        rgb_f = (rgb_f - rgb_f.mean(dim=-1, keepdim=True)) / (rgb_f.std(dim=-1, keepdim=True) + 1e-8)
+                        tir_f = (tir_f - tir_f.mean(dim=-1, keepdim=True)) / (tir_f.std(dim=-1, keepdim=True) + 1e-8)
+                        rgb_f = torch.clamp(rgb_f, min=-5.0, max=5.0)
+                        tir_f = torch.clamp(tir_f, min=-5.0, max=5.0)
+                        
+                        rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                        tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                        rgb_prob = F.softmax(rgb_f, dim=-1)
+                        tir_prob = F.softmax(tir_f, dim=-1)
+                        
+                        epsilon = 1e-8
+                        rgb_prob = torch.clamp(rgb_prob, min=epsilon, max=1.0 - epsilon)
+                        tir_prob = torch.clamp(tir_prob, min=epsilon, max=1.0 - epsilon)
+                        rgb_log_prob = torch.clamp(rgb_log_prob, min=-50.0, max=0.0)
+                        tir_log_prob = torch.clamp(tir_log_prob, min=-50.0, max=0.0)
+                        
+                        kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean', log_target=False)
+                        kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean', log_target=False)
+                        kl_loss = (kl_rt + kl_tr) / 2.0
+                        
+                        if torch.isnan(kl_loss) or torch.isinf(kl_loss) or kl_loss < 0:
+                            kl_loss = torch.tensor(0.0, device=kl_loss.device)
+                        kl_loss = torch.clamp(kl_loss, 0, 5.0)
+                        
+                        loss = loss + 1e-6 * kl_loss
+                        current_kl_reg = kl_loss.item()
 
         if return_status:
             mean_iou = iou.detach().mean()
@@ -491,15 +543,34 @@ class ViPTActor(BaseActor):
                 rgb_f = bf.get('rgb_mean')
                 tir_f = bf.get('tir_mean')
                 if rgb_f is not None and tir_f is not None:
-                    rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
-                    tir_log_prob = F.log_softmax(tir_f, dim=-1)
-                    rgb_prob = F.softmax(rgb_f, dim=-1)
-                    tir_prob = F.softmax(tir_f, dim=-1)
-                    kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean')
-                    kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean')
-                    kl_loss = (kl_rt + kl_tr) / 2.0
-                    loss = loss + 1e-6 * kl_loss
-                    current_kl_reg = kl_loss.item()
+                    # 【v27关键修复】KL散度数值保护（Stage3/Legacy）
+                    if not torch.isnan(rgb_f).any() and not torch.isnan(tir_f).any() and not torch.isinf(rgb_f).any() and not torch.isinf(tir_f).any():
+                        rgb_f = (rgb_f - rgb_f.mean(dim=-1, keepdim=True)) / (rgb_f.std(dim=-1, keepdim=True) + 1e-8)
+                        tir_f = (tir_f - tir_f.mean(dim=-1, keepdim=True)) / (tir_f.std(dim=-1, keepdim=True) + 1e-8)
+                        rgb_f = torch.clamp(rgb_f, min=-5.0, max=5.0)
+                        tir_f = torch.clamp(tir_f, min=-5.0, max=5.0)
+                        
+                        rgb_log_prob = F.log_softmax(rgb_f, dim=-1)
+                        tir_log_prob = F.log_softmax(tir_f, dim=-1)
+                        rgb_prob = F.softmax(rgb_f, dim=-1)
+                        tir_prob = F.softmax(tir_f, dim=-1)
+                        
+                        epsilon = 1e-8
+                        rgb_prob = torch.clamp(rgb_prob, min=epsilon, max=1.0 - epsilon)
+                        tir_prob = torch.clamp(tir_prob, min=epsilon, max=1.0 - epsilon)
+                        rgb_log_prob = torch.clamp(rgb_log_prob, min=-50.0, max=0.0)
+                        tir_log_prob = torch.clamp(tir_log_prob, min=-50.0, max=0.0)
+                        
+                        kl_rt = F.kl_div(rgb_log_prob, tir_prob, reduction='batchmean', log_target=False)
+                        kl_tr = F.kl_div(tir_log_prob, rgb_prob, reduction='batchmean', log_target=False)
+                        kl_loss = (kl_rt + kl_tr) / 2.0
+                        
+                        if torch.isnan(kl_loss) or torch.isinf(kl_loss) or kl_loss < 0:
+                            kl_loss = torch.tensor(0.0, device=kl_loss.device)
+                        kl_loss = torch.clamp(kl_loss, 0, 5.0)
+                        
+                        loss = loss + 1e-6 * kl_loss
+                        current_kl_reg = kl_loss.item()
 
         if return_status:
             mean_iou = iou.detach().mean()

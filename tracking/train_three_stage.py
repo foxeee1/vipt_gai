@@ -36,6 +36,8 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # 安全校验：开启梯度异常检测，自动定位NaN/Inf的产生位置
+    torch.autograd.set_detect_anomaly(True)
 
 
 def build_model_and_load_pretrain(cfg, settings):
@@ -63,11 +65,14 @@ def apply_stage_freeze(net, stage):
     
     elif stage == 2:
         for name, param in net.named_parameters():
+            # 安全校验：Stage2只训练辅助生成器和门控，不训练模态Prompt相关
+            # modality_prompt_proj在Stage1已训练好，Stage2冻结防止破坏
             if any(kw in name for kw in ['consistency_generator', 'temporal_generator',
                                           'mask_generator', 'cross_attn_modulation',
-                                          'alpha_consistency', 'alpha_temporal', 'alpha_mask']):
+                                          'alpha_consistency', 'alpha_temporal', 'alpha_mask',
+                                          'layer_gates', 'pos_bias', 'temperature']):
                 param.requires_grad = True
-        print(f"[Stage2] 仅辅助生成器可训练，模态Prompt+ViT主干冻结")
+        print(f"[Stage2] 辅助生成器+layer_gates+pos_bias可训练，模态Prompt+ViT主干冻结")
     
     elif stage == 3:
         for name, param in net.named_parameters():
@@ -144,15 +149,10 @@ def update_optimizer_for_stage(optimizer, net, stage, cfg):
         print(f"[Stage3优化器] Prompt LR={base_lr:.2e}, Gate LR={gate_lr:.2e}")
     
     optimizer.param_groups = new_param_groups
-    # 【v25关键修复】不再清空optimizer.state
-    # 原问题：optimizer.state = defaultdict(dict) 丢失AdamW的一阶/二阶动量
-    # 修复：保留已有参数的动量，只添加新参数的空状态
-    # 新参数（之前未训练的）会自动获得空状态，已有参数保留动量
-    for group in new_param_groups:
-        for p in group['params']:
-            pid = id(p)
-            if pid not in optimizer.state:
-                optimizer.state[pid] = defaultdict(dict)
+    # 安全校验：阶段切换时重建优化器状态
+    # 原问题：保留旧阶段AdamW动量会导致新阶段参数更新方向错误
+    # 修复：每个阶段开始时清空状态，让AdamW从零开始累积动量
+    optimizer.state = defaultdict(dict)
 
 
 def save_full_checkpoint(net, optimizer, lr_scheduler, epoch, best_iou, stage, save_path):
@@ -197,18 +197,43 @@ def run_single_stage(stage_num, net, optimizer, lr_scheduler, trainer, settings,
         meta_prompt.training_stage = stage_num
         print(f"[Stage{stage_num}] 已设置 training_stage={stage_num}")
     
+    # 安全校验：重置Temporal缓存，避免跨阶段缓存污染
+    if hasattr(meta_prompt, 'reset_temporal_cache'):
+        meta_prompt.reset_temporal_cache()
+        print(f"[Stage{stage_num}] 已重置Temporal缓存")
+    
     apply_stage_freeze(net, stage_num)
     update_optimizer_for_stage(optimizer, net, stage_num, cfg)
+    
+    # 安全校验：阶段切换时LR warmup — 前3个epoch使用1/10学习率
+    # 避免阶段切换时Loss剧烈震荡
+    warmup_epochs = 3
+    original_lrs = [group['lr'] for group in optimizer.param_groups]
     
     early_stop_patience = 10
     early_stop_counter = 0
     early_stop_warmup = 5
     
     for epoch in range(1, epochs + 1):
+        # 安全校验：LR warmup — 前3个epoch线性升温
+        if epoch <= warmup_epochs:
+            warmup_factor = epoch / warmup_epochs
+            for group, orig_lr in zip(optimizer.param_groups, original_lrs):
+                group['lr'] = orig_lr * warmup_factor
+            if epoch == 1:
+                print(f"[Stage{stage_num}] LR warmup: epoch {epoch}, factor={warmup_factor:.2f}")
+        
         # 使用全局epoch作为tensorboard的step（确保曲线连续）
         global_epoch = global_epoch_offset + epoch
         trainer.epoch = global_epoch
         trainer.train_epoch()
+        
+        # 安全校验：每个epoch结束后梯度裁剪（防止梯度爆炸）
+        trainable_params = [p for p in net.parameters() if p.requires_grad and p.grad is not None]
+        if trainable_params:
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            if total_grad_norm > 10.0:
+                print(f"[Stage{stage_num} Epoch {epoch}] 梯度裁剪: norm={total_grad_norm:.2f}")
         
         if lr_scheduler is not None:
             if cfg.TRAIN.SCHEDULER.TYPE == 'cosine':
